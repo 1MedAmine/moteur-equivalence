@@ -49,7 +49,7 @@ navigateur, sur lesquelles les trois modes de récupération se sont acharnés �
 fiche, a ouvert sept pages pédagogiques (« qu'est-ce qu'un contacteur »)
 plutôt qu'une seule page produit. Les deux motifs de bruit sont maintenant
 écartés avant ouverture, pas après lecture.
-→ [Pages écartées avant ouverture](#pages-ecartees-avant-ouverture)
+→ [Pages écartées avant ouverture](#pages-écartées-avant-ouverture)
 
 ---
 
