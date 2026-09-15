@@ -1,0 +1,21 @@
+{
+  "_lisez_moi": [
+    "Connaissance de marques utilisée PAR LA SUITE DE TESTS de ce paquet.",
+    "Elle est séparée de `marques.exemple.json`, qui porte les valeurs livrées",
+    "avec le dépôt : les tests doivent pouvoir exercer le moteur sans dépendre",
+    "de ce que le domaine de démonstration contient ce mois-ci, et le domaine",
+    "de démonstration doit pouvoir changer sans casser 860 tests.",
+    "Le fichier est désigné par `conftest.py`, via B2_MARQUES_CONNUES."
+  ],
+  "domaines_officiels": {
+    "norel": ["norel.example"],
+    "kerion": ["kr.example", "kerion-electric.example"],
+    "se": ["kr.example", "kerion-electric.example"],
+    "fg": ["ferolt.example"],
+    "pnx": ["pnx.example", "pnxworld.example"]
+  },
+  "alias_canoniques": {
+    "se": ["kerion"],
+    "kerion electric": ["kerion"]
+  }
+}

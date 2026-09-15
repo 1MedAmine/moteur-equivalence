@@ -1,0 +1,21 @@
+{
+  "product": "Contacteur tripolaire",
+  "origin_brand": "",
+  "criteria": [
+    {
+      "id": "tension",
+      "label": "Tension de commande",
+      "requested_value": "24 V DC"
+    },
+    {
+      "id": "courant",
+      "label": "Courant nominal",
+      "requested_value": "9 A"
+    },
+    {
+      "id": "poles",
+      "label": "Nombre de pôles",
+      "requested_value": "3 pôles"
+    }
+  ]
+}

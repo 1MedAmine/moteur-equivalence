@@ -1,0 +1,26 @@
+{
+  "_lisez_moi": [
+    "Connaissance de marques du moteur d'équivalence. Le moteur n'en connaît",
+    "aucune par lui-même : c'est son invariant. Ce fichier est le seul endroit",
+    "où une marque est nommée.",
+    "Les valeurs livrées sont celles des jeux de démonstration du dépôt :",
+    "des fabricants entièrement INVENTÉS. Remplacez-les par les vôtres et",
+    "désignez votre fichier par B2_MARQUES_CONNUES.",
+    "domaines_officiels : marque normalisée -> domaines enregistrables que",
+    "  `_manufacturer_domain` accepte comme site officiel. Les jeux de jetons",
+    "  se notent séparés par une espace (« vantek industrie »).",
+    "alias_canoniques : forme courte documentée -> forme canonique. Un alias",
+    "  de deux caractères ou moins n'est jamais élargi hors de cette table."
+  ],
+  "domaines_officiels": {
+    "vantek": ["vantek.example", "vantek-industrie.example"],
+    "vk": ["vantek.example", "vantek-industrie.example"],
+    "orbex": ["orbex.example"],
+    "solira": ["solira.example"],
+    "kirova": ["kirova.example", "kirova-parts.example"]
+  },
+  "alias_canoniques": {
+    "vk": ["vantek"],
+    "vantek industrie": ["vantek"]
+  }
+}

@@ -1,0 +1,33 @@
+# Dependances du moteur d'equivalence (nom de code B2).
+#
+# Installer dans un venv propre a ce moteur, jamais partage avec un autre
+# systeme :
+#   python -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt
+#   .venv\Scripts\patchright.exe install chromium
+#
+# ScrapeGraphAI 2.x exige langchain 1.x. Si ce moteur est embarque aux cotes
+# d'un systeme epingle sur une version differente de langchain, les deux ne
+# peuvent pas cohabiter dans le meme environnement : d'ou le venv separe.
+
+scrapegraphai==2.1.6
+
+# Récupération HTML robuste.
+scrapling[fetchers]==0.4.14
+# Liste publique des suffixes embarquée, utilisée hors ligne pour valider
+# les domaines fabricant internationaux sans heuristique de TLD incomplète.
+tld==0.13.2
+
+# Extraction PDF hybride : texte PyMuPDF, tableaux Camelot.
+PyMuPDF>=1.24,<2
+camelot-py==2.0.0
+
+# Lecture du .env local.
+python-dotenv>=1,<2
+
+# Lecture des fiches techniques au format PDF.
+pydantic>=2,<3
+
+# Tests.
+pytest>=8
+hypothesis>=6,<7

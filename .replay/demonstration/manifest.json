@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-01-01T00:00:00Z",
+  "target_brand": "",
+  "threshold": 75,
+  "strict_evidence": true,
+  "B2_MODEL": "corpus-fabrique/demonstration",
+  "code": {
+    "git_commit": "unavailable",
+    "sha256": "9df430ef84078946da0d6ab20afd0cfa2cff588750af9a2ba80136e880f110a2"
+  },
+  "fiche": {
+    "path": "",
+    "sha256": "f28da6d602a06cb1075e02f8d1b2cd1407ce6556bd410e1f4e089c9d55f12992",
+    "hash_scope": "extracted_text"
+  },
+  "audit_waves": [
+    1,
+    1,
+    2,
+    2,
+    2
+  ],
+  "page_waves": {
+    "https://vantek.example/pieces/vt-4120": 1,
+    "https://kirova.example/fr/kv-4120": 1,
+    "https://orbex.example/catalogue/ob-4120": 2,
+    "https://revendeur-industriel.example/orbex/ob-4120": 2,
+    "https://solira.example/produits/sl-4120": 2
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "logical_queries_at_entry": 0,
+      "logical_queries_before_near_miss": 3,
+      "seen_signatures_at_entry": [],
+      "seen_signatures_before_near_miss": []
+    },
+    {
+      "wave": 2,
+      "logical_queries_at_entry": 3,
+      "logical_queries_before_near_miss": 6,
+      "seen_signatures_at_entry": [
+        "contacteur-3p-24vdc"
+      ],
+      "seen_signatures_before_near_miss": [
+        "contacteur-3p-24vdc"
+      ]
+    }
+  ]
+}

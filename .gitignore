@@ -1,0 +1,26 @@
+# Secrets — jamais versionnés.
+.env
+.env.*
+!.env.example
+
+# Environnement et caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+.hypothesis/
+
+# Sorties de travail
+resultats/
+*.log
+
+# Cache de pages : contenu web capturé, jamais reproductible d'un run à l'autre.
+.cache_pages/
+
+# Corpus de rejeu : seul le corpus de démonstration fabriqué est versionné
+# (voir scripts/fabriquer_corpus_rejeu.py). Un corpus capturé depuis un run
+# réel (B2_REPLAY_DIR) reste un artefact de debug local, jamais versionné.
+.replay/*
+!.replay/demonstration/

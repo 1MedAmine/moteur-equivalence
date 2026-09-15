@@ -1,0 +1,225 @@
+[
+  {
+    "page_url": "https://vantek.example/pieces/vt-4120",
+    "candidates": [
+      {
+        "brand": "Vantek",
+        "reference": "VT-4120",
+        "criteria": [
+          {
+            "requirement_id": "tension",
+            "requested_value": "24 V DC",
+            "observed_value": "24 V DC",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://vantek.example/pieces/vt-4120",
+                "excerpt": "Tension de commande 24 V DC",
+                "type": "web_officiel"
+              }
+            ]
+          },
+          {
+            "requirement_id": "courant",
+            "requested_value": "9 A",
+            "observed_value": "9 A",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://vantek.example/pieces/vt-4120",
+                "excerpt": "Courant nominal 9 A",
+                "type": "web_officiel"
+              }
+            ]
+          },
+          {
+            "requirement_id": "poles",
+            "requested_value": "3 pôles",
+            "observed_value": "3 pôles",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://vantek.example/pieces/vt-4120",
+                "excerpt": "3 pôles",
+                "type": "web_officiel"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "page_url": "https://kirova.example/fr/kv-4120",
+    "candidates": [
+      {
+        "brand": "Kirova",
+        "reference": "KV-4120",
+        "criteria": [
+          {
+            "requirement_id": "tension",
+            "requested_value": "24 V DC",
+            "observed_value": "48 V DC",
+            "status": "incompatible",
+            "proofs": [
+              {
+                "url": "https://kirova.example/fr/kv-4120",
+                "excerpt": "Tension de commande 48 V DC",
+                "type": "web_officiel"
+              }
+            ]
+          },
+          {
+            "requirement_id": "courant",
+            "requested_value": "9 A",
+            "observed_value": "9 A",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://kirova.example/fr/kv-4120",
+                "excerpt": "Courant nominal 9 A",
+                "type": "web_officiel"
+              }
+            ]
+          },
+          {
+            "requirement_id": "poles",
+            "requested_value": "3 pôles",
+            "observed_value": "3 pôles",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://kirova.example/fr/kv-4120",
+                "excerpt": "3 pôles",
+                "type": "web_officiel"
+              }
+            ]
+          }
+        ],
+        "deviations": [
+          "Commande 48 V DC au lieu des 24 V demandés."
+        ]
+      }
+    ]
+  },
+  {
+    "page_url": "https://orbex.example/catalogue/ob-4120",
+    "candidates": [
+      {
+        "brand": "Orbex",
+        "reference": "OB-4120",
+        "criteria": [
+          {
+            "requirement_id": "tension",
+            "requested_value": "24 V DC",
+            "observed_value": "24 V DC",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://orbex.example/catalogue/ob-4120",
+                "excerpt": "Tension de commande 24 V DC",
+                "type": "web_officiel"
+              }
+            ]
+          },
+          {
+            "requirement_id": "courant",
+            "requested_value": "9 A",
+            "observed_value": "9 A",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://orbex.example/catalogue/ob-4120",
+                "excerpt": "Courant nominal 9 A",
+                "type": "web_officiel"
+              }
+            ]
+          },
+          {
+            "requirement_id": "poles",
+            "requested_value": "3 pôles",
+            "observed_value": "",
+            "status": "not_proven",
+            "proofs": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "page_url": "https://revendeur-industriel.example/orbex/ob-4120",
+    "candidates": [
+      {
+        "brand": "Orbex",
+        "reference": "OB-4120",
+        "criteria": [
+          {
+            "requirement_id": "tension",
+            "requested_value": "24 V DC",
+            "observed_value": "",
+            "status": "not_proven",
+            "proofs": []
+          },
+          {
+            "requirement_id": "courant",
+            "requested_value": "9 A",
+            "observed_value": "",
+            "status": "not_proven",
+            "proofs": []
+          },
+          {
+            "requirement_id": "poles",
+            "requested_value": "3 pôles",
+            "observed_value": "3 pôles",
+            "status": "proven",
+            "proofs": [
+              {
+                "url": "https://revendeur-industriel.example/orbex/ob-4120",
+                "excerpt": "3 pôles",
+                "type": "web_secondaire"
+              }
+            ]
+          }
+        ],
+        "limitations": [
+          "Nombre de pôles confirmé par un revendeur, pas par le fabricant."
+        ]
+      }
+    ]
+  },
+  {
+    "page_url": "https://solira.example/produits/sl-4120",
+    "candidates": [
+      {
+        "brand": "Solira",
+        "reference": "SL-4120",
+        "criteria": [
+          {
+            "requirement_id": "tension",
+            "requested_value": "24 V DC",
+            "observed_value": "",
+            "status": "not_proven",
+            "proofs": []
+          },
+          {
+            "requirement_id": "courant",
+            "requested_value": "9 A",
+            "observed_value": "",
+            "status": "not_proven",
+            "proofs": []
+          },
+          {
+            "requirement_id": "poles",
+            "requested_value": "3 pôles",
+            "observed_value": "",
+            "status": "not_proven",
+            "proofs": []
+          }
+        ],
+        "limitations": [
+          "La page du fabricant ne publie aucune valeur."
+        ]
+      }
+    ]
+  }
+]
