@@ -24,19 +24,83 @@ from recherche_adaptative import (
     MAX_LOGICAL_QUERIES,
     MAX_PAGES_OPENED,
     AdaptiveResearch,
+    HitContext,
+    _hit_matches_context,
 )
 from scraping import PageContent
 from rejeu import replay_corpus
 
 
-EXCERPT = "Tension de commande 24 V DC"
+def test_sparse_search_result_without_numeric_query_anchor_is_rejected():
+    context = HitContext(
+        wave=1,
+        query="Deep groove ball bearing 6205 technical sheet",
+        candidate_keys=(),
+        hit=SearchHit(
+            url="https://sports.example/horse-racing/live",
+            title="Live racing",
+            snippet="",
+            engine="test",
+            rank=1,
+        ),
+    )
+
+    assert not _hit_matches_context(context)
+
+
+def test_sparse_search_result_with_numeric_query_anchor_is_kept():
+    context = HitContext(
+        wave=1,
+        query="Deep groove ball bearing 6205 technical sheet",
+        candidate_keys=(),
+        hit=SearchHit(
+            url="https://catalog.example/products/6205",
+            title="",
+            snippet="",
+            engine="test",
+            rank=1,
+        ),
+    )
+
+    assert _hit_matches_context(context)
+
+
+def test_generic_bearing_result_without_numeric_family_does_not_consume_a_page():
+    context = HitContext(
+        wave=1,
+        query="6205 deep groove ball bearing sealed both sides",
+        candidate_keys=(),
+        hit=SearchHit(
+            url="https://catalog.example/general-bearings",
+            title="Deep groove ball bearing sealed both sides catalog",
+            snippet="General bearing dimensions",
+            engine="test",
+            rank=1,
+        ),
+    )
+
+    assert not _hit_matches_context(context)
+
+
+#: Une phrase reelle par indice de critere placeholder (r1..r4), pour que la
+#: preuve partagee de `candidate()` enonce ce qu'elle est censee prouver.
+_PLACEHOLDER_PHRASES = (
+    "Tension de commande 24 V DC",
+    "Trois pôles",
+    "Courant 9 A",
+    "Fréquence 50 Hz",
+)
+_PLACEHOLDER_VALUES = ("24 V DC", "Trois pôles", "9 A", "50 Hz")
 
 
 def requirements():
     return RequirementSet(
         product="Produit source",
         criteria=[
-            Requirement(id=f"r{i}", label=f"Critère {i}", requested_value=f"v{i}", critical=True)
+            Requirement(
+                id=f"r{i}", label=f"Critère {i}",
+                requested_value=_PLACEHOLDER_VALUES[i - 1], critical=True,
+            )
             for i in range(1, 5)
         ],
     )
@@ -92,23 +156,51 @@ class FakeGateway:
         )
 
 
+def _phrases_for(statuses):
+    """Une phrase par statut qui a besoin d'une preuve, jamais pour `not_proven`.
+
+    Une phrase laissee pour un critere volontairement non prouve fuirait sur
+    la page simulee et se ferait mecaniquement "retrouver" par le
+    reaudit des pages officielles — ce n'est pas ce qu'un scenario `not_proven`
+    verifie.
+    """
+    return [
+        _PLACEHOLDER_PHRASES[i] for i, status in enumerate(statuses)
+        if status != "not_proven"
+    ]
+
+
+def _page_content(phrases):
+    return "Norel REF-1 REF-INVENTEE. " + (". ".join(phrases) + ". ") * 8
+
+
 class FakeFetcher:
     def fetch(self, url):
-        content = f"Norel REF-1 REF-INVENTEE. {(EXCERPT + '. ') * 8}"
+        # Contenu minimal par defaut : une page non explicitement couverte
+        # par un test (les autres resultats de recherche d'une meme vague,
+        # notamment) ne doit porter que la premiere phrase, jamais celle
+        # d'un critere qu'un scenario precis veut laisser `not_proven` —
+        # sans quoi le reaudit des pages officielles la retrouverait ailleurs
+        # que sur la page que le test construit lui-meme.
+        content = _page_content(_PLACEHOLDER_PHRASES[:1])
         return PageContent(url, content, "Norel REF-1", "scrapling")
 
 
 def candidate(statuses, url):
+    evidence = SourceProof(
+        url=url,
+        excerpt=". ".join(_phrases_for(statuses)),
+        type="web_officiel",
+    )
     return CandidateAudit(
         brand="Norel",
         reference="REF-1",
         criteria=[CriterionAudit(
             requirement_id=f"r{i}",
-            requested_value=f"v{i}",
-            observed_value=f"v{i}",
+            requested_value=_PLACEHOLDER_VALUES[i - 1],
+            observed_value=_PLACEHOLDER_VALUES[i - 1],
             status=status,
-            proofs=[SourceProof(url=url, excerpt=EXCERPT, type="web_officiel")]
-            if status != "not_proven" else [],
+            proofs=[evidence] if status != "not_proven" else [],
         ) for i, status in enumerate(statuses, start=1)],
     )
 
@@ -129,7 +221,12 @@ def analyzer_sequence(statuses_by_wave):
             return [], []
         page = pages[0]
         audit = PageAudit(page_url=page.url, candidates=[candidate(statuses, page.url)])
-        return [PageAnalysis(page.url, page.content, audit)], []
+        # Le contenu simule ne porte que ce que cette vague prouve : sinon la
+        # page contiendrait aussi la phrase d'un critere volontairement
+        # `not_proven`, laissant le reaudit des pages officielles la retrouver
+        # mecaniquement et contredire le scenario teste.
+        content = _page_content(_phrases_for(statuses))
+        return [PageAnalysis(page.url, content, audit)], []
 
     return analyze
 
@@ -261,7 +358,8 @@ def test_proven_result_stays_prioritary_over_page_level_rate_limit():
             page_url=page.url,
             candidates=[candidate(["proven"] * 4, page.url)],
         )
-        return [PageAnalysis(page.url, page.content, audit)], [
+        content = _page_content(_phrases_for(["proven"] * 4))
+        return [PageAnalysis(page.url, content, audit)], [
             "Page non exploitée (https://maker.example/x) : RateLimitError "
             "[mode=audit, source=contenu, 100 caractères récupérés]."
         ]
@@ -352,7 +450,8 @@ def test_candidate_contract_error_is_journaled_without_raw_message():
         malformed = candidate(["proven"] * 4, page.url)
         malformed.criteria[0].requested_value = "valeur réécrite"
         audit = PageAudit(page_url=page.url, candidates=[malformed])
-        return [PageAnalysis(page.url, page.content, audit)], []
+        content = _page_content(_phrases_for(["proven"] * 4))
+        return [PageAnalysis(page.url, content, audit)], []
 
     outcome = research(analyze).run("fiche", "Norel")
 
@@ -394,7 +493,8 @@ def test_invalid_candidate_is_ignored_without_losing_valid_candidate():
         )
         invalid.criteria[0].proofs[0].excerpt = "extrait absent de la page"
         audit = PageAudit(page_url=page.url, candidates=[invalid, valid])
-        return [PageAnalysis(page.url, page.content, audit)], []
+        content = _page_content(_phrases_for(["proven"] * 4))
+        return [PageAnalysis(page.url, content, audit)], []
 
     outcome = research(analyze).run("fiche", "Norel")
 
@@ -430,6 +530,37 @@ def test_fallback_query_plan_is_visible_in_diagnostics():
 
     assert outcome.status == "complete"
     assert outcome.diagnostics.warnings == ["Plan de requêtes : secours déterministe."]
+
+
+def test_fallback_query_plan_surfaces_sanitized_failure_reasons():
+    class FallbackPlanner(FakePlanner):
+        def plan_queries(self, requirement_set, target_brand, missing, previous):
+            plan = super().plan_queries(requirement_set, target_brand, missing, previous)
+            return plan.model_copy(update={
+                "strategy": "fallback",
+                "failures": (
+                    "tentative 1 : erreur modèle APITimeoutError",
+                    "tentative 2 : réponse invalide — exactement quatre requêtes requises",
+                ),
+            })
+
+    service = AdaptiveResearch(
+        config=B2Config(api_key="test"),
+        planner=FallbackPlanner(),
+        gateway=FakeGateway(),
+        fetcher=FakeFetcher(),
+        analyze_pages=analyzer_sequence([["proven"] * 4]),
+        graph_config={},
+    )
+
+    outcome = service.run("fiche", "Norel")
+
+    assert outcome.status == "complete"
+    assert outcome.diagnostics.warnings == [
+        "Plan de requêtes : secours déterministe. "
+        "Motifs : tentative 1 : erreur modèle APITimeoutError ; "
+        "tentative 2 : réponse invalide — exactement quatre requêtes requises"
+    ]
 
 
 def test_run_captures_an_immediately_replayable_corpus_when_enabled(

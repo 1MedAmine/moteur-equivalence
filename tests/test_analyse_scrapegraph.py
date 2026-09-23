@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analyse import analyser_page, examiner_pages
 from candidats import CandidateLead, CandidateOccurrence, DiscoveryLimits, build_discovery_document
+from compatibilite import evaluate_candidates
 from mission import construire_mission_audit
 from modeles import Requirement, RequirementSet
 from scraping import PageContent
@@ -34,6 +35,23 @@ def requirements():
             critical=True,
         )],
     )
+
+
+def test_audit_prompt_requires_an_explicitly_different_categorical_state_to_be_incompatible():
+    requirements_with_sealing = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(
+            id="sealing", label="Sealing", requested_value="with seals on both sides",
+        )],
+    )
+
+    prompt = construire_mission_audit(
+        requirements_with_sealing, None, URL,
+    )
+
+    assert "état catégoriel différent" in prompt
+    assert "shielded" in prompt
+    assert "incompatible" in prompt
 
 
 def valid_audit(url=URL):
@@ -68,6 +86,18 @@ def audit_candidate(brand: str, reference: str, url: str = URL):
             "status": "not_proven",
             "proofs": [],
         }],
+    }
+
+
+def declared_criteria(*candidate_audits):
+    return {
+        "candidate_criteria": [
+            {
+                "candidate_index": index,
+                "criteria": candidate["criteria"],
+            }
+            for index, candidate in enumerate(candidate_audits)
+        ],
     }
 
 
@@ -180,11 +210,109 @@ def test_targeted_mode_keeps_the_audit_contract_and_declares_its_mode():
         {},
         mode="targeted",
         authorized_candidates=(candidate_lead("Norel", "REF-1"),),
-        graph_factory=factory({}, valid_audit()),
+        graph_factory=factory({}, declared_criteria(valid_audit()["candidates"][0])),
     )
 
     assert result.mode == "targeted"
     assert result.audit.candidates[0].reference == "REF-1"
+
+
+def test_targeted_empty_model_audit_declares_candidate_and_reports_anomaly():
+    result = analyser_page(
+        PageContent(URL, CONTENT, "Norel REF-1", "scrapling"),
+        requirements(),
+        "Norel",
+        {},
+        mode="targeted",
+        authorized_candidates=(candidate_lead("Norel", "REF-1"),),
+        graph_factory=factory({}, {"candidate_criteria": []}),
+    )
+
+    assert [(item.brand, item.reference) for item in result.audit.candidates] == [
+        ("Norel", "REF-1")
+    ]
+    assert [
+        (item.requirement_id, item.requested_value, item.status, item.proofs)
+        for item in result.audit.candidates[0].criteria
+    ] == [("tension", "24 V DC", "not_proven", [])]
+    assert result.validation_diagnostics == ({
+        "stage": "page_audit",
+        "path": "candidate_criteria",
+        "issue": "empty_declared_audit",
+        "action": "defaulted_not_proven",
+    },)
+
+
+def test_targeted_empty_criteria_group_declares_candidate_and_reports_anomaly():
+    result = analyser_page(
+        PageContent(URL, CONTENT, "Norel REF-1", "scrapling"),
+        requirements(),
+        "Norel",
+        {},
+        mode="targeted",
+        authorized_candidates=(candidate_lead("Norel", "REF-1"),),
+        graph_factory=factory({}, {"candidate_criteria": [{
+            "candidate_index": 0,
+            "criteria": [],
+        }]}),
+    )
+
+    assert result.audit.candidates[0].criteria[0].status == "not_proven"
+    assert result.validation_diagnostics == ({
+        "stage": "page_audit",
+        "path": "candidate_criteria[0].criteria",
+        "issue": "empty_declared_audit",
+        "action": "defaulted_not_proven",
+    },)
+
+
+def test_discovery_with_confirmed_identity_declares_candidate_before_model_audit():
+    captured = {}
+    result = analyser_page(
+        PageContent(URL, CONTENT, "Norel REF-1", "scrapling"),
+        requirements(),
+        "Norel",
+        {},
+        mode="discovery",
+        authorized_candidates=(candidate_lead("Norel", "REF-1"),),
+        graph_factory=factory(
+            captured,
+            declared_criteria(valid_audit()["candidates"][0]),
+        ),
+    )
+
+    assert captured["schema"].__name__ == "DeclaredCandidateCriteriaEnvelope"
+    assert [(item.brand, item.reference) for item in result.audit.candidates] == [
+        ("Norel", "REF-1")
+    ]
+    assert result.mode == "discovery"
+
+
+def test_targeted_declared_candidate_keeps_literal_proof_scoring_contract():
+    result = analyser_page(
+        PageContent(URL, CONTENT, "Norel REF-1", "scrapling"),
+        requirements(),
+        "Norel",
+        {},
+        mode="targeted",
+        authorized_candidates=(candidate_lead("Norel", "REF-1"),),
+        graph_factory=factory({}, declared_criteria(valid_audit()["candidates"][0])),
+    )
+
+    evaluations = evaluate_candidates(
+        requirements(),
+        [result.audit],
+        "Norel",
+        75,
+        {URL: CONTENT},
+    )
+
+    assert len(evaluations) == 1
+    assert evaluations[0].summary.reference == "REF-1"
+    assert evaluations[0].summary.score == 100
+    assert evaluations[0].candidate.criteria[0].proofs[0].excerpt == (
+        "Tension de commande 24 V DC"
+    )
 
 
 def test_page_audit_keeps_valid_criterion_when_its_sibling_is_invalid():
@@ -389,16 +517,13 @@ def test_page_audit_reports_stage_and_path_after_the_single_retry_fails():
     assert "provider included" not in warnings[0]
 
 
-def test_targeted_mode_keeps_only_the_authorized_exact_page_identity():
+def test_targeted_mode_constructs_only_the_authorized_exact_page_identity():
     captured = {}
-    audit = {
-        "page_url": URL,
-        "candidates": [
-            audit_candidate("Maker", "ZX-41-7"),
-            audit_candidate("Maker", "ZX-41-8"),
-            audit_candidate("InventedCo", "ZX-41-7"),
-        ],
-    }
+    audit = declared_criteria(audit_candidate("Maker", "ZX-41-7"))
+    audit["candidate_criteria"].append({
+        "candidate_index": 1,
+        "criteria": audit_candidate("Maker", "ZX-41-8")["criteria"],
+    })
 
     result = analyser_page(
         PageContent(URL, "Maker ZX-41-7 technical data", "Maker ZX-41-7", "scrapling"),
@@ -426,10 +551,30 @@ def test_targeted_low_confidence_lead_still_requires_the_brand_on_the_page():
         authorized_candidates=(
             candidate_lead("TargetCo", "ZX-41-7", low_confidence=True),
         ),
-        graph_factory=factory({}, {
-            "page_url": URL,
-            "candidates": [audit_candidate("TargetCo", "ZX-41-7")],
-        }),
+        graph_factory=factory({}, declared_criteria(
+            audit_candidate("TargetCo", "ZX-41-7")
+        )),
+    )
+
+    assert result.audit.candidates == []
+
+
+def test_targeted_mode_does_not_combine_brand_and_reference_from_neighbours():
+    content = (
+        "FAG 6205-C-2Z-C3 bearing. "
+        "KINEX 6205-2ZR C3 bearing."
+    )
+
+    result = analyser_page(
+        PageContent(URL, content, "SKF 6205-2Z/C3", "scrapling"),
+        requirements(),
+        None,
+        {},
+        mode="targeted",
+        authorized_candidates=(candidate_lead("FAG", "6205 2ZR.C3"),),
+        graph_factory=factory({}, declared_criteria(
+            audit_candidate("FAG", "6205 2ZR.C3")
+        )),
     )
 
     assert result.audit.candidates == []
@@ -452,13 +597,10 @@ def test_targeted_mode_keeps_two_authorized_identities_from_one_graph_call():
             candidate_lead("Maker", "ZX-41-7"),
             candidate_lead("Maker", "QK-900"),
         ),
-        graph_factory=factory(captured, {
-            "page_url": URL,
-            "candidates": [
-                audit_candidate("Maker", "ZX-41-7"),
-                audit_candidate("Maker", "QK-900"),
-            ],
-        }),
+        graph_factory=factory(captured, declared_criteria(
+            audit_candidate("Maker", "ZX-41-7"),
+            audit_candidate("Maker", "QK-900"),
+        )),
     )
 
     assert [item.reference for item in result.audit.candidates] == ["ZX-41-7", "QK-900"]
@@ -560,6 +702,9 @@ def test_targeted_audit_prompt_names_allowed_identity_and_forbids_substitutions(
     )
 
     assert "Maker ZX-41-7" in prompt
+    assert "déjà déclarés" in prompt
+    assert "ne décides pas" in prompt
+    assert "candidate_index" in prompt
     assert "variantes" in prompt.casefold()
     assert "accessoires" in prompt.casefold()
     assert "gammes voisines" in prompt.casefold()

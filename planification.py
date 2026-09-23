@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Planification B2 : critères ScrapeGraphAI et quatre requêtes par vague."""
+"""Planification B2 : critères ScrapeGraphAI et requêtes par vague."""
 
 from __future__ import annotations
 
@@ -23,11 +23,15 @@ import configuration
 import recherche
 from candidats import (
     CandidateLead,
+    brand_is_present,
+    canonical_candidate_key,
     is_origin_identity,
+    origin_identities,
     query_contains_identity,
     reference_is_present,
 )
 from configuration import B2Config
+from indisponibilite import executer_avec_reprises_llm
 from couverture_criteres import (
     CoverageAssessment,
     evaluer_couverture,
@@ -40,7 +44,11 @@ from modeles import (
     RequirementAddition,
     RequirementSet,
     RequirementSupplement,
+    SearchHit,
 )
+
+_QUERIES_PER_WAVE = configuration.MAX_QUERIES_PER_WAVE
+_MAX_QUERY_WORDS = 14
 
 
 _GRAPH_OUTPUT_GUARD = RLock()
@@ -68,6 +76,7 @@ _REQUIREMENT_ISSUES = frozenset({
     "invalid_structure",
     "json_parse_error",
     "unit_label_disagreement",
+    "temporary_model_unavailable",
 })
 _REQUIREMENT_ACTIONS = frozenset({
     "aborted",
@@ -231,8 +240,20 @@ def _clip_rectangle(
 
 
 class QueryPlan(BaseModel):
-    queries: tuple[str, str, str, str]
+    # Les doubles de test et les anciens corpus peuvent porter un plan de quatre
+    # requêtes. L'orchestrateur conserve son plafond de trois ; le planificateur
+    # réel, lui, n'émet plus que ce nombre.
+    queries: tuple[str, ...]
     strategy: Literal["model", "retry", "fallback"] = "model"
+    failures: tuple[str, ...] = ()
+
+
+class SearchCandidateHint(BaseModel):
+    """Identité provisoire copiée d’un résultat de recherche indexé."""
+
+    result_index: int = Field(ge=0)
+    brand: str = Field(min_length=1)
+    reference: str = Field(min_length=1)
 
 
 class TargetedQuery(BaseModel):
@@ -242,7 +263,7 @@ class TargetedQuery(BaseModel):
 
 
 class TargetedQueryPlan(BaseModel):
-    queries: tuple[TargetedQuery, TargetedQuery, TargetedQuery, TargetedQuery]
+    queries: tuple[TargetedQuery, ...]
     strategy: Literal["targeted"] = "targeted"
 
 
@@ -271,35 +292,99 @@ def _extract_query_list(response: str) -> list[str]:
     raise PlanningError("Le plan de requêtes ne contient aucune liste JSON valide.")
 
 
+def _compact_query_value(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    normalized = "".join(
+        character for character in normalized
+        if not unicodedata.combining(character)
+    )
+    return re.sub(r"[^a-z0-9]+", "", normalized)
+
+
 def _normalize_queries(
     raw: object,
     requirements: RequirementSet,
     target_brand: str | None,
     previous_queries: Set[str],
-) -> tuple[str, str, str, str]:
-    if not isinstance(raw, list) or len(raw) != 4 or not all(
+) -> tuple[str, ...]:
+    if not isinstance(raw, list) or len(raw) != _QUERIES_PER_WAVE or not all(
         isinstance(item, str) for item in raw
     ):
-        raise PlanningError("Le plan doit contenir exactement quatre requêtes.")
+        raise PlanningError(
+            f"Le plan doit contenir exactement {_QUERIES_PER_WAVE} requêtes."
+        )
 
     queries: list[str] = []
     previous = {" ".join(item.split()).casefold() for item in previous_queries}
-    for item in raw:
+    family = _source_reference_family(requirements)
+    family_pattern = re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(family)}(?![A-Za-z0-9])",
+        flags=re.IGNORECASE,
+    ) if family else None
+    suffixes = _source_designation_suffixes(requirements)
+    semantic_value = next((
+        criterion.requested_value
+        for criterion in requirements.criteria
+        if len(re.findall(r"[A-Za-zÀ-ÿ]+", criterion.requested_value)) >= 3
+        and not any(
+            re.search(rf"(?<![A-Za-z0-9]){re.escape(suffix)}(?![A-Za-z0-9])", criterion.requested_value, re.IGNORECASE)
+            for suffix in suffixes
+        )
+    ), "")
+    for index, item in enumerate(raw):
         query = recherche._nettoyer(item)
         query = recherche.retirer_origine(query, requirements.origin_brand)
+        query = _replace_source_references_with_family(query, requirements)
+        for suffix in suffixes:
+            pattern = rf"(?<![A-Za-z0-9]){re.escape(suffix)}(?![A-Za-z0-9])"
+            replacement = semantic_value if index == 0 else ""
+            query = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
+        query = recherche._nettoyer(query)
+        if family_pattern is not None and not family_pattern.search(query):
+            query = recherche._nettoyer(f"{family} {query}")
         if target_brand and target_brand.strip():
             query = recherche.ajouter_marque(query, target_brand.strip())
+        if len(query.split()) > _MAX_QUERY_WORDS:
+            raise PlanningError(
+                f"Les requêtes ne doivent pas dépasser {_MAX_QUERY_WORDS} mots."
+            )
         normalized = " ".join(query.split()).casefold()
         current = {" ".join(existing.split()).casefold() for existing in queries}
         if not query or normalized in previous or normalized in current:
-            raise PlanningError("Les quatre requêtes doivent être nouvelles et uniques.")
+            raise PlanningError(
+                f"Les {_QUERIES_PER_WAVE} requêtes doivent être nouvelles et uniques."
+            )
         queries.append(query)
     return tuple(queries)  # type: ignore[return-value]
+
+
+def _planning_exception_reason(error: Exception) -> str:
+    status = getattr(error, "status_code", None)
+    if not isinstance(status, int):
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+    return f"erreur modèle {type(error).__name__}{suffix}"
+
+
+def _planning_validation_reason(error: PlanningError) -> str:
+    message = str(error)
+    if "dépasser" in message and "mots" in message:
+        return "requêtes trop longues"
+    if "aucune liste JSON valide" in message:
+        return "aucune liste JSON valide"
+    if "exactement" in message and "requêtes" in message:
+        return f"exactement {_QUERIES_PER_WAVE} requêtes requises"
+    if "nouvelles et uniques" in message:
+        return "requêtes non nouvelles ou dupliquées"
+    return "contrat de requêtes non respecté"
 
 
 def _fallback_query_core(
     requirements: RequirementSet,
     missing: Sequence[str],
+    *,
+    criterion_offset: int = 0,
 ) -> str:
     missing_keys = {" ".join(item.split()).casefold() for item in missing}
     identity_words = {"reference", "marque", "gamme", "brand", "modele", "model"}
@@ -318,11 +403,181 @@ def _fallback_query_core(
             not item.critical,
         ),
     )
+    window_size = 3 if criterion_offset == 0 else 4
+    selected = ordered[criterion_offset:criterion_offset + window_size]
+    if not selected:
+        selected = ordered[:3]
+    elif criterion_offset:
+        # Les requêtes suivantes existent précisément pour exposer les
+        # discriminants qui n'entraient pas dans la première. Les placer en
+        # tête les protège de la borne générale de seize mots.
+        selected = list(reversed(selected))
     fragments = [
         f"{item.label} {item.requested_value}"
-        for item in ordered[:3]
+        for item in selected
     ]
-    return recherche._nettoyer("produit industriel " + " ".join(fragments))
+    product = recherche.retirer_origine(
+        requirements.product, requirements.origin_brand
+    )
+    # Les valeurs techniques seront réparties par les fragments ci-dessous.
+    # Les laisser aussi dans le libellé produit les répète et surpondère la
+    # même contrainte dans la requête de secours.
+    for item in sorted(
+        requirements.criteria,
+        key=lambda criterion: len(criterion.requested_value),
+        reverse=True,
+    ):
+        value = item.requested_value.strip()
+        if len(_compact_query_value(value)) < 3:
+            continue
+        product = re.sub(re.escape(value), " ", product, flags=re.IGNORECASE)
+    identities = origin_identities(requirements)
+    family_anchor = _source_reference_family(requirements)
+    product_words: list[str] = []
+    for word in product.split():
+        stripped = word.strip(" ,;:.()[]{}")
+        is_origin = (
+            is_origin_identity(stripped, "", requirements)
+            or canonical_candidate_key("", stripped)[1]
+            in identities.references | identities.ranges
+        )
+        if not is_origin:
+            product_words.append(word)
+        elif family_anchor:
+            product_words.append(family_anchor)
+    safe_product = recherche._nettoyer(" ".join(product_words))
+    if not safe_product:
+        safe_product = "produit industriel"
+    return recherche._nettoyer(safe_product + " " + " ".join(fragments))
+
+
+_SOURCE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)"
+    r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![A-Za-z0-9])"
+)
+
+
+def _source_designation_suffixes(requirements: RequirementSet) -> tuple[str, ...]:
+    """Codes distinctifs après un séparateur de la référence source."""
+    suffixes: set[str] = set()
+    for match in _SOURCE_REFERENCE.finditer(requirements.product):
+        for suffix in re.split(r"[-_]", match.group(0))[1:]:
+            if (
+                len(suffix) >= 4
+                and any(character.isalpha() for character in suffix)
+                and any(character.isdigit() for character in suffix)
+            ):
+                suffixes.add(suffix.casefold())
+    return tuple(sorted(suffixes, key=len, reverse=True))
+
+
+def _semantic_source_designation_values(requirements: RequirementSet) -> RequirementSet:
+    """Une définition `code: sens` demande le sens, pas le code du fabricant."""
+    suffixes = set(_source_designation_suffixes(requirements))
+    if not suffixes:
+        return requirements
+    criteria: list[Requirement] = []
+    changed = False
+    for criterion in requirements.criteria:
+        match = re.match(r"^\s*([A-Za-z0-9_-]+)\s*:\s*(\S.*)$", criterion.requested_value)
+        if match and match.group(1).casefold() in suffixes:
+            criteria.append(criterion.model_copy(update={
+                "requested_value": match.group(2).strip(),
+            }))
+            changed = True
+        else:
+            criteria.append(criterion)
+    return requirements.model_copy(update={"criteria": criteria}) if changed else requirements
+
+
+def _replace_source_references_with_family(
+    query: str,
+    requirements: RequirementSet,
+) -> str:
+    """Remplace la référence source exacte par son préfixe de famille littéral."""
+    family = _source_reference_family(requirements)
+    if not family:
+        return query
+    references = tuple(dict.fromkeys(
+        match.group(0) for match in _SOURCE_REFERENCE.finditer(requirements.product)
+    ))
+    rewritten = query
+    for reference in references:
+        parts = re.findall(r"[A-Za-z0-9]+", reference)
+        if not parts:
+            continue
+        pattern = r"(?<![A-Za-z0-9])" + r"[\W_]*".join(
+            re.escape(part) for part in parts
+        ) + r"(?![A-Za-z0-9])"
+        rewritten = re.sub(pattern, family, rewritten, flags=re.IGNORECASE)
+    return recherche._nettoyer(rewritten)
+
+
+def _source_reference_family(requirements: RequirementSet) -> str:
+    """Retourne seulement le préfixe littéral partagé avant le premier suffixe."""
+    matches = list(_SOURCE_REFERENCE.finditer(requirements.product))
+    if not matches:
+        return ""
+    reference = max((match.group(0) for match in matches), key=len)
+    family = re.split(r"[-_]", reference, maxsplit=1)[0]
+    return family if len(family) >= 4 and any(char.isdigit() for char in family) else ""
+
+
+def _family_query(
+    requirements: RequirementSet,
+    target_brand: str | None,
+) -> str:
+    anchor = _source_reference_family(requirements)
+    if not anchor:
+        return ""
+    product = requirements.product
+    for match in _SOURCE_REFERENCE.finditer(requirements.product):
+        product = product.replace(match.group(0), anchor)
+    product = recherche.retirer_origine(product, requirements.origin_brand)
+    values = " ".join(
+        item.requested_value for item in requirements.criteria[:3]
+    )
+    product_tokens = product.split()
+    if product_tokens and product_tokens[0].casefold() == anchor.casefold():
+        product_tokens = product_tokens[1:]
+    query = recherche._nettoyer(
+        f"{anchor} {' '.join(product_tokens)} equivalent fiche produit {values}"
+    )
+    if target_brand and target_brand.strip():
+        query = recherche.ajouter_marque(query, target_brand.strip())
+    return query
+
+
+def _ensure_family_query(
+    queries: tuple[str, ...],
+    requirements: RequirementSet,
+    target_brand: str | None,
+    previous_queries: Set[str],
+) -> tuple[str, ...]:
+    anchor = _source_reference_family(requirements)
+    if not anchor:
+        return queries
+    replacement = _family_query(requirements, target_brand)
+    normalized = " ".join(replacement.split()).casefold()
+    previous = {" ".join(item.split()).casefold() for item in previous_queries}
+    if not replacement or normalized in previous:
+        return queries
+    family_pattern = re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])",
+        flags=re.IGNORECASE,
+    )
+    if any(family_pattern.search(query) for query in queries):
+        return queries
+    existing = next((
+        index for index, query in enumerate(queries)
+        if " ".join(query.split()).casefold() == normalized
+    ), None)
+    if existing is not None:
+        if existing < _QUERIES_PER_WAVE:
+            return queries
+    replaced = list(queries)
+    replaced[min(2, len(replaced) - 1)] = replacement
+    return tuple(replaced)
 
 
 def _fallback_queries(
@@ -330,8 +585,7 @@ def _fallback_queries(
     target_brand: str | None,
     missing: Sequence[str],
     previous_queries: Set[str],
-) -> tuple[str, str, str, str]:
-    core = _fallback_query_core(requirements, missing)
+) -> tuple[str, ...]:
     angles = (
         "fiche produit",
         "caractéristiques techniques",
@@ -340,7 +594,12 @@ def _fallback_queries(
     )
     previous = {" ".join(item.split()).casefold() for item in previous_queries}
     queries: list[str] = []
-    for index, angle in enumerate(angles, start=1):
+    for index, angle in enumerate(angles[:_QUERIES_PER_WAVE], start=1):
+        core = _fallback_query_core(
+            requirements,
+            missing,
+            criterion_offset=(index - 1) * 3,
+        )
         variant = 0
         while True:
             marker = "" if variant == 0 else f" variante{variant}"
@@ -662,6 +921,42 @@ def _validate_requirement_items(
         )) from None
 
 
+_REFERENCE_ONLY_PRODUCT = re.compile(
+    r"^\s*(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)"
+    r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\s*$"
+)
+
+
+def _complete_reference_only_product(
+    requirements: RequirementSet,
+    source: str,
+) -> RequirementSet:
+    """Ajoute le type littéral voisin si le modèle n'a rendu que la référence."""
+    product = requirements.product.strip()
+    if not _REFERENCE_ONLY_PRODUCT.fullmatch(product):
+        return requirements
+    lines = [line.strip() for line in source.splitlines()]
+    positions = [index for index, line in enumerate(lines) if line == product]
+    for position in positions:
+        neighbours = [
+            *lines[position + 1:position + 4],
+            *reversed(lines[max(0, position - 3):position]),
+        ]
+        for descriptor in neighbours:
+            words = re.findall(r"[^\W\d_]+", descriptor, flags=re.UNICODE)
+            if (
+                len(words) < 2
+                or len(descriptor) > 160
+                or ":" in descriptor
+                or descriptor == descriptor.upper()
+            ):
+                continue
+            return requirements.model_copy(update={
+                "product": f"{descriptor} {product}",
+            })
+    return requirements
+
+
 _LABEL_UNIT_FAMILIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("frequency", ("frequence", "frequency")),
     ("time", ("intervalle", "periode", "duree", "temps", "lifetime", "vie")),
@@ -802,13 +1097,17 @@ def _run_graph_with_single_json_retry(
 ) -> object:
     """Même contrat que l'audit : un seul rejeu, réservé au parsing JSON."""
     for attempt, current_prompt in enumerate((prompt, _recovery_prompt(prompt))):
-        graph = graph_factory(
-            prompt=current_prompt,
-            source=source,
-            config=graph_config,
-            schema=schema,
-        )
-        try:
+        parser_error: OutputParserException | None = None
+
+        def run_graph():
+            # Recréer le graphe sur une indisponibilité de fournisseur évite
+            # de réutiliser un client ou un parseur laissés en erreur.
+            graph = graph_factory(
+                prompt=current_prompt,
+                source=source,
+                config=graph_config,
+                schema=schema,
+            )
             # ScrapeGraphAI peut inclure la réponse brute dans sa sortie standard
             # ou dans un handler pré-lié avant de lever OutputParserException.
             # La coupure de logs est globale : la garde empêche deux extractions
@@ -824,7 +1123,22 @@ def _run_graph_with_single_json_retry(
                         return graph.run()
                 finally:
                     logging.disable(previous_logging_disable)
+
+        def note_retry(_error: BaseException) -> None:
+            diagnostics.append({
+                "stage": stage,
+                "path": "$",
+                "issue": "temporary_model_unavailable",
+                "action": "retried",
+            })
+
+        try:
+            return executer_avec_reprises_llm(run_graph, on_retry=note_retry)
         except OutputParserException as error:
+            parser_error = error
+
+        if parser_error is not None:
+            error = parser_error
             llm_output = getattr(error, "llm_output", None)
             try:
                 return _extract_json_value(str(llm_output or ""))
@@ -874,6 +1188,7 @@ class Planner:
         self.last_coverage: CoverageAssessment | None = None
         self.last_second_pass = False
         self.last_requirement_diagnostics: list[dict[str, str]] = []
+        self.last_search_discovery_failures: tuple[str, ...] = ()
 
     def _call_llm(self, prompt: str) -> str:
         if self._call_llm_override is not None:
@@ -881,19 +1196,24 @@ class Planner:
         from openai import OpenAI
 
         self.config.require_runtime()
-        llm = configuration.config_llm(self.config)
+        # Ces appels demandent un contrat JSON (`queries` ou `candidates`).
+        # Le canal de réflexion de Nemotron peut remplacer ce contrat par du
+        # texte libre ; il est donc réservé aux appels qui n'ont pas de schéma.
+        llm = configuration.config_llm(self.config, structured_output=True)
         client = OpenAI(
             api_key=llm["api_key"],
             base_url=llm["base_url"],
             timeout=llm["timeout"],
             max_retries=0,
         )
-        response = client.chat.completions.create(
-            model=self.config.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.config.temperature,
-            max_tokens=500,
-            extra_body=llm.get("extra_body") or None,
+        response = executer_avec_reprises_llm(
+            lambda: client.chat.completions.create(
+                model=self.config.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=llm["temperature"],
+                max_tokens=500,
+                extra_body=llm.get("extra_body") or None,
+            )
         )
         return response.choices[0].message.content or ""
 
@@ -922,6 +1242,8 @@ class Planner:
             raw,
             diagnostics=self.last_requirement_diagnostics,
         )
+        requirements = _complete_reference_only_product(requirements, fiche)
+        requirements = _semantic_source_designation_values(requirements)
         coverage = evaluer_couverture(fiche, requirements)
         self.last_coverage = coverage
         self.last_second_pass = bool(coverage.orphans)
@@ -966,9 +1288,9 @@ class Planner:
                     diagnostics=self.last_requirement_diagnostics,
                 )
             )
-        return self._merge_literal_supplement(
+        return _semantic_source_designation_values(self._merge_literal_supplement(
             requirements, supplement, fiche, coverage, source_path
-        )
+        ))
 
     @staticmethod
     def _can_use_visual_pass(
@@ -1056,14 +1378,16 @@ class Planner:
                         "demandé, sans Markdown ni commentaire et sans inventer."
                     ),
                 })
-            response = client.chat.completions.create(
-                model=self.config.vision_model,
-                messages=[
-                    {"role": "system", "content": "/no_think"},
-                    {"role": "user", "content": current_content},
-                ],
-                temperature=0,
-                max_tokens=2000,
+            response = executer_avec_reprises_llm(
+                lambda: client.chat.completions.create(
+                    model=self.config.vision_model,
+                    messages=[
+                        {"role": "system", "content": "/no_think"},
+                        {"role": "user", "content": current_content},
+                    ],
+                    temperature=0,
+                    max_tokens=2000,
+                )
             )
             raw = response.choices[0].message.content or ""
             try:
@@ -1133,7 +1457,8 @@ class Planner:
         source_key = cls._literal_key(fiche)
         missing_specs = [
             item for item in coverage.orphans
-            if item.reason == "missing_spec" and item.value
+            if item.reason in {"missing_spec", "missing_categorical_spec"}
+            and item.value
         ]
         existing_ids = {item.id for item in requirements.criteria}
         existing_values = {
@@ -1262,7 +1587,7 @@ class Planner:
                 continue
             selected_list.append(candidate)
             selected_keys.add(candidate.key)
-            if len(selected_list) == 4:
+            if len(selected_list) == _QUERIES_PER_WAVE:
                 break
         selected = tuple(selected_list)
         if not selected:
@@ -1282,7 +1607,7 @@ class Planner:
         # identités différentes. Les angles supplémentaires ne viennent
         # qu'après ce premier tour de couverture.
         quotas = [1] * len(selected)
-        for index in range(4 - len(selected)):
+        for index in range(_QUERIES_PER_WAVE - len(selected)):
             quotas[index % len(selected)] += 1
         allocated: list[list[TargetedQuery]] = []
         used = set(previous)
@@ -1303,7 +1628,7 @@ class Planner:
                     break
             if len(lead_queries) != quota:
                 raise PlanningError(
-                    "Impossible de produire quatre requêtes ciblées uniques."
+                    f"Impossible de produire {_QUERIES_PER_WAVE} requêtes ciblées uniques."
                 )
             allocated.append(lead_queries)
 
@@ -1312,9 +1637,11 @@ class Planner:
             for lead_queries in allocated:
                 if position < len(lead_queries):
                     planned.append(lead_queries[position])
-        if len(planned) == 4:
+        if len(planned) == _QUERIES_PER_WAVE:
             return TargetedQueryPlan(queries=tuple(planned))
-        raise PlanningError("Impossible de produire quatre requêtes ciblées uniques.")
+        raise PlanningError(
+            f"Impossible de produire {_QUERIES_PER_WAVE} requêtes ciblées uniques."
+        )
 
     def plan_distributor_queries(
         self,
@@ -1346,6 +1673,129 @@ class Planner:
                 used.add(normalized)
         return tuple(queries)
 
+    def discover_search_candidates(
+        self,
+        requirements: RequirementSet,
+        hits: Sequence[SearchHit],
+        target_brand: str | None,
+    ) -> tuple[SearchCandidateHint, ...]:
+        """Relève des identités littérales avant la recherche de leurs fiches.
+
+        Un résultat de moteur sert uniquement à orienter la vague suivante.
+        La compatibilité restera établie sur une page téléchargée et auditée.
+        """
+        self.last_search_discovery_failures = ()
+        unique_hits: list[SearchHit] = []
+        seen_urls: set[str] = set()
+        for hit in hits:
+            url_key = hit.url.strip().casefold()
+            if not url_key or url_key in seen_urls:
+                continue
+            seen_urls.add(url_key)
+            unique_hits.append(hit)
+        if not unique_hits:
+            return ()
+
+        entries = "\n\n".join(
+            f"RESULT {index}\nURL: {hit.url[:500]}\n"
+            f"TITLE: {hit.title[:500]}\nSNIPPET: {hit.snippet[:800]}"
+            for index, hit in enumerate(unique_hits)
+        )
+        target_rule = (
+            f"La marque demandée est {target_brand.strip()} : ne garde que cette marque."
+            if target_brand and target_brand.strip()
+            else "Aucune marque n’est imposée : privilégie des fabricants distincts."
+        )
+        criteria = "\n".join(
+            f"- {item.label}: {item.requested_value}"
+            + (" (critique)" if item.critical else "")
+            for item in requirements.criteria
+        )
+        prompt = f"""Lis les résultats Web indexés ci-dessous et relève au maximum 4
+produits candidats. Réponds uniquement par l’objet JSON
+{{"candidates": [{{"result_index": 0, "brand": "...", "reference": "..."}}]}}.
+
+Règles obligatoires :
+- Copie la marque et la référence littéralement depuis le même résultat indexé.
+- Le champ result_index désigne exactement le numéro RESULT correspondant.
+- N’infère, ne complète et n’invente aucune référence depuis tes connaissances.
+- Ignore les descriptions, matériaux, avis, noms de distributeurs et dimensions.
+- Ignore la marque source et le produit source.
+- Garde seulement une référence de produit précise, jamais une famille générique.
+- Écarte un résultat qui contredit explicitement un critère technique demandé.
+  L’absence d’une valeur dans l’extrait n’est pas une contradiction.
+- Une liste vide est correcte si aucune identité marque + référence n’est explicite.
+- Ces identités sont des pistes de recherche, jamais des preuves de compatibilité.
+
+Produit source : {requirements.product}
+Marque source interdite : {requirements.origin_brand or "aucune"}
+{target_rule}
+
+Critères techniques demandés :
+{criteria}
+
+RÉSULTATS :
+{entries}"""
+
+        failures: list[str] = []
+        for attempt in range(2):
+            try:
+                response = self._call_llm(prompt)
+                payload = _extract_json_value(response)
+            except Exception as error:
+                failures.append(
+                    f"tentative {attempt + 1} : {_planning_exception_reason(error)}"
+                )
+                continue
+            raw_items = (
+                payload.get("candidates") if isinstance(payload, Mapping)
+                else payload if isinstance(payload, list)
+                else None
+            )
+            if not isinstance(raw_items, list):
+                failures.append(
+                    f"tentative {attempt + 1} : réponse invalide — candidats absents"
+                )
+                continue
+            selected: list[SearchCandidateHint] = []
+            seen_keys: set[tuple[str, str]] = set()
+            for raw in raw_items:
+                try:
+                    hint = SearchCandidateHint.model_validate(raw)
+                except ValidationError:
+                    continue
+                if hint.result_index >= len(unique_hits):
+                    continue
+                hit = unique_hits[hint.result_index]
+                literal_source = "\n".join((hit.url, hit.title, hit.snippet))
+                if (
+                    not brand_is_present(hint.brand, literal_source)
+                    or not reference_is_present(hint.reference, literal_source)
+                    or is_origin_identity(
+                        hint.brand, hint.reference, requirements
+                    )
+                ):
+                    continue
+                if target_brand and target_brand.strip():
+                    expected_brand = canonical_candidate_key(
+                        target_brand.strip(), ""
+                    )[0]
+                    actual_brand = canonical_candidate_key(hint.brand, "")[0]
+                    if expected_brand != actual_brand:
+                        continue
+                key = canonical_candidate_key(hint.brand, hint.reference)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                selected.append(hint)
+                if len(selected) == 4:
+                    break
+            self.last_search_discovery_failures = tuple(failures)
+            return tuple(selected)
+
+        self.last_search_discovery_failures = tuple(failures)
+        return ()
+
     def plan_queries(
         self,
         requirements: RequirementSet,
@@ -1353,17 +1803,78 @@ class Planner:
         missing: Sequence[str],
         previous_queries: Set[str],
     ) -> QueryPlan:
-        target = target_brand.strip() if target_brand and target_brand.strip() else "aucune marque imposée"
-        prompt = f"""Produis exactement quatre requêtes Web complémentaires pour trouver une
-fiche produit industrielle équivalente chez {target}. Réponds uniquement par
-une liste JSON de quatre chaînes. Chaque requête doit viser une fiche produit,
-être courte, contenir les caractéristiques discriminantes et ne jamais citer
-la marque, la gamme ou la référence du produit d'origine. Les quatre angles
-sont : référence/gamme cible, caractéristiques, documentation constructeur et
-comparaison technique.
+        target = target_brand.strip() if target_brand and target_brand.strip() else ""
+        source_references = tuple(dict.fromkeys(
+            match.group(0) for match in _SOURCE_REFERENCE.finditer(requirements.product)
+        ))
+        source_reference = max(source_references, key=len, default="aucune")
+        reference_family = _source_reference_family(requirements) or "aucune"
+        safe_product = _replace_source_references_with_family(
+            requirements.product, requirements
+        )
+        safe_product = recherche.retirer_origine(safe_product, requirements.origin_brand)
+        criteria = "\n".join(
+            f"- {item.label}: {item.requested_value}"
+            + (" (critique)" if item.critical else "")
+            for item in requirements.criteria
+        )
+        mode = (
+            f"Marque cible explicite : {target}. Ne cite aucune autre marque."
+            if target
+            else "Mode ouvert : ne cite aucune marque."
+        )
+        prompt = f"""Produis exactement {_QUERIES_PER_WAVE} requêtes Web complémentaires pour découvrir des
+références alternatives puis trouver la fiche d’un produit compatible. Réponds uniquement par une liste JSON de {_QUERIES_PER_WAVE} chaînes,
+sous la forme {{"queries": ["...", "...", "..."]}}.
 
-Critères immuables :
-{requirements.model_dump_json(indent=2)}
+Règles obligatoires :
+- Chaque requête contient de 6 à 14 mots.
+- Vise 6 à 10 mots ; utilise 11 à 14 mots seulement si une valeur essentielle
+  serait sinon perdue.
+- Chaque requête est une recherche Web, jamais une phrase explicative.
+- Chaque requête doit contenir le type de produit fourni ci-dessous, dans la
+  langue technique la plus susceptible d’apparaître sur les fiches recherchées.
+- Exprime ce type par son nom générique le plus court et non ambigu, en trois
+  mots au maximum ; ne recopie pas tout le libellé du produit.
+- Supprime les synonymes, adjectifs génériques et labels redondants : conserve
+  les valeurs et les termes qui distinguent réellement un résultat.
+- Compacte seulement les valeurs présentes dans les critères : rapproche un
+  nombre de son unité et regroupe avec x ou × les dimensions qui forment
+  explicitement un ensemble. N’invente aucune valeur ni aucun exemple.
+- Chaque requête retient au plus 4 valeurs techniques distinctes, choisies
+  pour distinguer un produit compatible ; répartis les autres valeurs utiles
+  sur les deux autres requêtes.
+- Ne recherche pas les détails de fabrication, de composition interne ou de
+  mise en œuvre lorsqu'une caractéristique fonctionnelle équivalente est
+  disponible dans les critères.
+- N’invente aucune marque ni référence alternative.
+- N’utilise jamais la marque source ni la référence source complète.
+- Si une famille de référence existe, utilise-la dans chaque requête : c’est
+  l’ancre commune qui relie les variantes normalisées du même produit.
+- Tu peux employer une notation technique générique déduite des critères, mais
+  jamais fabriquer une référence de fabricant inconnue.
+- Une requête sert à découvrir les références concurrentes ; les deux autres
+  visent la page d’un seul produit identifiable par une référence ou un modèle,
+  jamais une page de catégorie ou une liste marchande.
+- Répartis les critères entre Les {_QUERIES_PER_WAVE} angles suivants :
+  1. famille + type court + valeurs compactes + notation technique générique ;
+  2. famille + type court + valeur critique littérale + valeurs compactes ;
+  3. famille + type court + synonyme technique courant du critère critique
+     + product ou datasheet.
+- Les termes techniques anglais sont autorisés lorsqu'ils améliorent la recherche.
+- En mode ouvert, rédige la deuxième requête en français technique pour
+  atteindre aussi les catalogues francophones : traduis le type de produit
+  et le critère critique, sans inventer de marque, de référence ni de valeur.
+  Conserve la famille et les nombres tels qu'ils figurent dans les critères.
+  Garde une autre requête dans la langue de la fiche ou en anglais technique.
+
+Produit sans identité source : {safe_product or requirements.product}
+Référence source complète interdite : {source_reference}
+Famille de référence autorisée : {reference_family}
+{mode}
+
+Critères techniques :
+{criteria}
 
 Critères encore non prouvés : {list(missing)}
 Requêtes déjà exécutées et interdites : {sorted(previous_queries)}"""
@@ -1371,24 +1882,36 @@ Requêtes déjà exécutées et interdites : {sorted(previous_queries)}"""
         repair = (
             prompt
             + "\n\nCORRECTION OBLIGATOIRE : la réponse précédente était invalide. "
-              "Réponds par un tableau JSON brut contenant exactement quatre "
-              "chaînes nouvelles et uniques, sans Markdown ni autre clé."
+              f"Réponds par l'objet JSON brut {{\"queries\": [..]}} contenant exactement "
+              f"{_QUERIES_PER_WAVE} chaînes nouvelles, uniques et de 6 à "
+              f"{_MAX_QUERY_WORDS} mots, sans Markdown ni autre clé."
         )
+        failures: list[str] = []
         for attempt, current_prompt in enumerate((prompt, repair)):
             try:
                 response = self._call_llm(current_prompt)
-            except Exception:
+            except Exception as error:
+                failures.append(
+                    f"tentative {attempt + 1} : {_planning_exception_reason(error)}"
+                )
                 continue
             try:
                 raw = _extract_query_list(response)
                 queries = _normalize_queries(
                     raw, requirements, target_brand, previous_queries
                 )
-            except PlanningError:
+            except PlanningError as error:
+                failures.append(
+                    f"tentative {attempt + 1} : réponse invalide — "
+                    f"{_planning_validation_reason(error)}"
+                )
                 continue
             return QueryPlan(
-                queries=queries,
+                queries=_ensure_family_query(
+                    queries, requirements, target_brand, previous_queries
+                ),
                 strategy="model" if attempt == 0 else "retry",
+                failures=tuple(failures),
             )
 
         return QueryPlan(
@@ -1396,4 +1919,5 @@ Requêtes déjà exécutées et interdites : {sorted(previous_queries)}"""
                 requirements, target_brand, missing, previous_queries
             ),
             strategy="fallback",
+            failures=tuple(failures),
         )

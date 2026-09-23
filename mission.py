@@ -290,7 +290,10 @@ Renseigne `origin_brand` avec sa marque et sa gamme d'origine lorsqu'elles sont
 explicitement présentes ; laisse ce champ vide si elles sont absentes. Chaque
 critère doit avoir un identifiant stable, un libellé,
 la valeur exactement demandée et un indicateur `critical`. Un critère est
-critique lorsqu'une différence empêcherait le remplacement direct. Ne complète
+critique uniquement lorsqu'une différence empêcherait le remplacement direct ;
+les performances indicatives, matériaux usuels et informations d'entretien ne
+le sont pas sans exigence explicite de la fiche. Écris toujours `critical`, même
+quand sa valeur est `false`. Ne complète
 aucune information absente et ne cherche encore aucune alternative.{selection}
 
 FICHE TECHNIQUE :
@@ -327,18 +330,31 @@ def construire_mission_audit(
 ) -> str:
     """Demande les faits et preuves d'une page, jamais un score libre."""
     cible = marque_cible.strip() if marque_cible and marque_cible.strip() else "toute marque concurrente"
-    restriction = ""
+    instruction = (
+        f"Cherche des candidats chez {cible}. Pour chaque candidat, copie la marque et la\n"
+        "référence telles qu'elles apparaissent dans la page."
+    )
+    conclusion = (
+        "Une liste de candidats vide est la bonne réponse si la page ne porte "
+        "pas de fiche produit exploitable."
+    )
     if authorized_candidates:
         identities = "\n".join(
-            f"- {lead.brand} {lead.reference}" for lead in authorized_candidates
+            f"- candidate_index {index}: {lead.brand} {lead.reference}"
+            for index, lead in enumerate(authorized_candidates)
         )
-        restriction = f"""
+        instruction = f"""Les candidats suivants sont déjà déclarés par le code après confirmation
+littérale de leur marque et de leur référence dans la page :
 
-IDENTITÉS CIBLÉES AUTORISÉES :
 {identities}
 
-Audite uniquement ces identités exactes. Les variantes, accessoires,
-gammes voisines et substitutions sont interdits, même s'ils semblent compatibles."""
+Tu ne décides pas si ces candidats existent et tu ne recopies ni leur marque ni
+leur référence. Pour chaque `candidate_index`, remplis uniquement `criteria`.
+Les variantes, accessoires, gammes voisines et substitutions sont interdits."""
+        conclusion = (
+            "Chaque candidat déclaré doit avoir une entrée `candidate_criteria`. "
+            "Un critère absent de la page reçoit `not_proven`."
+        )
     # Les critères d'identité d'origine sont retirés : demander à un modèle de
     # prouver qu'un Norel est « Kerion Electric » est une consigne
     # contradictoire, et `evaluate_candidates` les classe de toute façon
@@ -348,8 +364,7 @@ gammes voisines et substitutions sont interdits, même s'ils semblent compatible
     return f"""Analyse uniquement le contenu de la page réellement visitée suivante :
 {page_url}
 
-Cherche des candidats chez {cible}. Pour chaque candidat, copie la marque et la
-référence telles qu'elles apparaissent dans la page.{restriction} Couvre exactement tous les
+{instruction} Couvre exactement tous les
 critères immuables ci-dessous, sans changer `requested_value` :
 {notables.model_dump_json(indent=2)}
 
@@ -360,10 +375,34 @@ Pour chaque critère, utilise uniquement l'un des statuts suivants :
 - `incompatible` : la page publie une valeur ou une plage qui exclut la valeur demandée.
   Ce statut exige un `observed_value` non vide copié depuis la page.
 
+Si la page énonce un état catégoriel différent pour la même propriété, le
+statut est obligatoirement `incompatible`, jamais `not_proven`. Par exemple,
+`shielded on both sides`, `open` ou `without seals` est incompatible avec une
+demande `sealed` ou `with seals on both sides`; inversement, ne transforme pas
+ce constat en preuve de la valeur demandée.
+
+Compare la fonction décrite, pas le code fabricant. Deux suffixes de référence
+différents ne prouvent à eux seuls ni une incompatibilité ni une équivalence.
+Par exemple, `seal on both sides` et `joints en caoutchouc double face`
+expriment la même étanchéité si l'extrait concerne bien le candidat.
+
 Tout statut `proven` ou `incompatible` exige l'URL exacte ci-dessus et un
-extrait littéral non vide de cette page. Ne cite aucune autre URL, ne reconstruis
-aucune référence et ne calcule aucun score. Une liste de candidats vide est la
-bonne réponse si la page ne porte pas de fiche produit exploitable."""
+extrait littéral non vide de cette page : copie une sous-chaîne exacte, avec sa
+casse, sa ponctuation et ses retours à la ligne. `observed_value` doit lui aussi
+être une sous-chaîne exacte de cet extrait. Pour une valeur textuelle `proven`,
+l'extrait doit énoncer explicitement la même propriété et la même valeur ;
+une formulation synonyme claire est acceptable, mais ne déduis jamais un
+type, une fonction ou une propriété d'un matériau voisin. Ne cite
+aucune autre URL, ne reconstruis aucune référence et ne calcule aucun score.
+
+Pour chaque preuve, vérifie dans cet ordre : le produit et variante concernés,
+la propriété demandée, la propriété réellement décrite, puis la valeur observée
+et son unité. Une valeur identique pour une autre propriété ne prouve rien.
+Une négation ou une formulation opposée est un écart, jamais une preuve. Les
+alternatives, recommandations, accessoires, produits voisins et références
+croisées peuvent faire découvrir une piste mais ne prouvent aucune
+caractéristique pour elle.
+{conclusion}"""
 
 
 def construire_mission_decouverte(

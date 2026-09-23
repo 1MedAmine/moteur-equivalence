@@ -265,6 +265,41 @@ def test_adaptive_report_keys_criterion_statuses_by_requirement_id_not_label():
     ]
 
 
+def test_eligible_candidate_with_noncritical_incompatibility_is_proposed_not_discarded():
+    result = outcome("partial", 75)
+    evaluation = result.evaluation
+    assert evaluation is not None
+    proof = SourceProof(
+        url=URL,
+        excerpt="Stock No. concurrent 9999",
+        type="web_officiel",
+    )
+    evaluation.candidate.criteria.append(CriterionAudit(
+        requirement_id="stock_no",
+        requested_value="7822",
+        observed_value="9999",
+        status="incompatible",
+        proofs=[proof],
+    ))
+    evaluation.summary.incompatible_criteria = ["Stock No."]
+    evaluation.summary.critical_blockers = []
+    evaluation.eligible = True
+    evaluation.complete = False
+    result.requirements.criteria.append(Requirement(
+        id="stock_no",
+        label="Stock No.",
+        requested_value="7822",
+        critical=False,
+    ))
+    result.visited_pages[URL] += " Stock No. concurrent 9999."
+
+    data = rapport.construire(result)
+
+    assert [item["reference"] for item in data["proposed_candidates"]] == ["REF-1"]
+    assert data["proposed_candidates"][0]["incompatible_criteria"] == ["Stock No."]
+    assert data["discarded_candidates"] == []
+
+
 def test_adaptive_report_never_serializes_a_rejected_proof_from_a_mixed_list():
     result = outcome("partial", 100)
     candidate = result.audits[0].candidates[0]

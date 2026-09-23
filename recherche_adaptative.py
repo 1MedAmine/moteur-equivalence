@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import inspect
+import unicodedata
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from analyse import (
 )
 from candidats import (
     CandidateLead,
+    CandidateProposal,
     CandidateRegistry,
     DiscoveryDocument,
     DiscoveryLimits,
@@ -62,7 +64,12 @@ from modeles import (
     SourceProof,
 )
 from planification import PlanningError, sanitize_requirement_diagnostics
-from recherche import SearxUnavailable, est_page_de_liste
+from recherche import (
+    SearxUnavailable,
+    est_page_de_liste,
+    metadata_has_numeric_anchor,
+    numeric_query_anchors,
+)
 from robustesse import hors_sujet, url_exploitable
 from rejeu import (
     candidate_contract_error_diagnostic,
@@ -221,6 +228,7 @@ def select_hit_contexts(
                 # Ecarte avant ouverture, donc sans consommer ni temps de
                 # recuperation ni place dans le budget de trente-six pages.
                 or hors_sujet(context.hit.url)
+                or not _hit_matches_context(context)
             ):
                 continue
             item = aggregated.setdefault(
@@ -273,6 +281,89 @@ def select_hit_contexts(
                 if len(selected) == limit:
                     return selected
     return selected
+
+
+_QUERY_TOKEN = re.compile(r"[a-z0-9]+(?:[-_./×][a-z0-9]+)*", re.IGNORECASE)
+_GENERIC_QUERY_WORDS = frozenset({
+    "catalogue", "caracteristiques", "comparison", "comparaison",
+    "constructeur", "datasheet", "documentation", "equivalent", "fiche",
+    "manufacturer", "produit", "product", "specifications", "technique",
+    "technical",
+})
+
+
+def _query_token_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    normalized = "".join(
+        character for character in normalized
+        if not unicodedata.combining(character)
+    )
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _hit_matches_context(context: HitContext) -> bool:
+    """Ne dépense une ouverture que si le résultat reprend la recherche."""
+    haystack = "\n".join((
+        unquote(context.hit.url), context.hit.title, context.hit.snippet,
+    ))
+    haystack_key = _query_token_key(haystack)
+    if context.candidate_keys:
+        return any(
+            len(reference) >= 4 and reference in haystack_key
+            for _, reference in context.candidate_keys
+        )
+
+    family_anchors = numeric_query_anchors(context.query)
+    if family_anchors:
+        return metadata_has_numeric_anchor(haystack, family_anchors)
+
+    raw_tokens = _QUERY_TOKEN.findall(context.query)
+    tokens = [_query_token_key(token) for token in raw_tokens]
+    significant = {
+        token for token in tokens
+        if len(token) >= 4 and token not in _GENERIC_QUERY_WORDS
+    }
+    # Les doubles de tests et certains moteurs internes emploient des clés
+    # opaques (`general-1`). Sans au moins deux termes de recherche réels, la
+    # métadonnée du résultat ne permet pas de conclure à l'absence de rapport.
+    metadata_tokens = {
+        _query_token_key(token)
+        for token in _QUERY_TOKEN.findall(
+            f"{context.hit.title}\n{context.hit.snippet}"
+        )
+    }
+    metadata_significant = {
+        token for token in metadata_tokens
+        if len(token) >= 4 and token not in _GENERIC_QUERY_WORDS
+    }
+    numeric_anchors = {
+        normalized for raw, normalized in zip(raw_tokens, tokens)
+        if len(normalized) >= 4 and re.search(r"\d{2,}", raw)
+    }
+    if numeric_anchors:
+        if any(anchor in haystack_key for anchor in numeric_anchors):
+            return True
+        textual_anchors = {
+            token for token in significant
+            if not any(character.isdigit() for character in token)
+        }
+        normalized_haystack = unicodedata.normalize("NFKD", haystack).casefold()
+        normalized_haystack = "".join(
+            character for character in normalized_haystack
+            if not unicodedata.combining(character)
+        )
+        haystack_tokens = set(re.findall(r"[a-z0-9]+", normalized_haystack))
+        return any(
+            token == anchor or token.startswith(anchor)
+            for anchor in textual_anchors
+            for token in haystack_tokens
+        )
+    if len(significant) < 2 or len(metadata_significant) < 2:
+        return True
+    haystack_tokens = {
+        _query_token_key(token) for token in _QUERY_TOKEN.findall(haystack)
+    }
+    return len(significant & haystack_tokens) >= 2
 
 
 #: Plafonds de pages, inchanges : ils bornent la mission independamment du
@@ -1197,6 +1288,9 @@ class AdaptiveResearch:
                 "retry": "Plan de requêtes : relance corrective.",
                 "fallback": "Plan de requêtes : secours déterministe.",
             }.get(strategy)
+            plan_failures = tuple(getattr(plan, "failures", ()))
+            if plan_warning and plan_failures:
+                plan_warning += " Motifs : " + " ; ".join(plan_failures)
             if plan_warning and plan_warning not in diagnostics.warnings:
                 diagnostics.warnings.append(plan_warning)
             contexts_by_query: list[list[HitContext]] = []
@@ -1274,6 +1368,96 @@ class AdaptiveResearch:
                     )
                     for hit in batch.hits
                 ])
+
+            # Les titres, URL et extraits du moteur peuvent déjà publier une
+            # identité marque + référence. On les utilise immédiatement pour
+            # préparer la vague ciblée suivante, y compris lorsque la limite
+            # de pages empêche d'ouvrir ce résultat de découverte. Ces pistes
+            # ne prouvent aucun critère : la page ciblée devra encore être
+            # téléchargée, passer la porte de contenu puis être auditée.
+            if mode == "discovery":
+                # Le modèle lit le corpus borné de titres et d'extraits pour
+                # distinguer une vraie
+                # marque des adjectifs voisins, puis le registre vérifie à
+                # nouveau chaque identité contre le résultat indiqué.
+                # L'heuristique ne s'exécute qu'en repli : la mélanger à une
+                # réponse modèle valide remettrait devant elle des marques
+                # parasites comme un matériau ou un titre éditorial.
+                discovery_planner = getattr(
+                    self.planner, "discover_search_candidates", None
+                )
+                unique_hits: list[SearchHit] = []
+                unique_hit_urls: set[str] = set()
+                for contexts in contexts_by_query:
+                    for context in contexts:
+                        url_key = context.hit.url.strip().casefold()
+                        if not url_key or url_key in unique_hit_urls:
+                            continue
+                        unique_hit_urls.add(url_key)
+                        unique_hits.append(context.hit)
+                hint_accepted = False
+                if callable(discovery_planner) and unique_hits:
+                    hints = discovery_planner(
+                        requirements, unique_hits, target_brand
+                    )
+                    for failure in tuple(getattr(
+                        self.planner, "last_search_discovery_failures", ()
+                    )):
+                        warning = f"Découverte de candidats : {failure}."
+                        if warning not in diagnostics.warnings:
+                            diagnostics.warnings.append(warning)
+                    for hint in hints:
+                        if hint.result_index >= len(unique_hits):
+                            continue
+                        hit = unique_hits[hint.result_index]
+                        metadata_document = build_discovery_document(
+                            url=hit.url,
+                            title=hit.title,
+                            snippets=[hit.snippet] if hit.snippet else [],
+                            content="",
+                            rank=hit.rank,
+                            limits=self.discovery_limits,
+                        )
+                        metadata_result = registry.ingest(
+                            [CandidateProposal(
+                                brand=hint.brand,
+                                reference=hint.reference,
+                            )],
+                            metadata_document,
+                            requirements,
+                            target_brand,
+                            allow_deterministic_fallback=False,
+                        )
+                        hint_accepted = (
+                            hint_accepted or bool(metadata_result.accepted)
+                        )
+                        for rejected in metadata_result.rejected:
+                            self._record_rejected_candidate(
+                                diagnostics, rejected
+                            )
+                if not hint_accepted:
+                    for contexts in contexts_by_query:
+                        for context in contexts:
+                            hit = context.hit
+                            metadata_document = build_discovery_document(
+                                url=hit.url,
+                                title=hit.title,
+                                snippets=[hit.snippet] if hit.snippet else [],
+                                content="",
+                                rank=hit.rank,
+                                limits=self.discovery_limits,
+                            )
+                            metadata_result = registry.ingest(
+                                (),
+                                metadata_document,
+                                requirements,
+                                target_brand,
+                                allow_deterministic_fallback=True,
+                            )
+                            for rejected in metadata_result.rejected:
+                                self._record_rejected_candidate(
+                                    diagnostics, rejected
+                                )
 
             deferred_near_miss_queries = tuple(
                 query for query in near_miss_en_tete
@@ -1401,6 +1585,18 @@ class AdaptiveResearch:
                     )
                     for rejected in fallback_result.rejected:
                         self._record_rejected_candidate(diagnostics, rejected)
+                active_after_ingest = registry.active()
+                for page in pages:
+                    canonical_page = canonical_url(page.url)
+                    page_leads = tuple(
+                        lead for lead in active_after_ingest
+                        if any(
+                            canonical_url(occurrence.url) == canonical_page
+                            for occurrence in lead.occurrences
+                        )
+                    )
+                    if page_leads:
+                        authorized_by_url[page.url] = page_leads
 
             # La porte decide page par page, `analyze_pages` traite un lot : on
             # filtre donc avant l'appel. Une vague peut ainsi n'avoir aucune

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +51,23 @@ class Stealthy:
         return self.response
 
 
+class BlockingStealthy(Stealthy):
+    def __init__(self, response=None):
+        super().__init__(response)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.second_started = threading.Event()
+
+    def fetch(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if len(self.calls) == 1:
+            self.started.set()
+        else:
+            self.second_started.set()
+        self.release.wait(timeout=2)
+        return self.response
+
+
 def response(html=HTML, status=200, content_type="text/html"):
     return SimpleNamespace(
         status=status,
@@ -90,6 +109,27 @@ def test_short_fast_content_uses_stealthy_then_stops():
     # Scrapling refuse `retries=0` (`Expected int >= 1`) : le barreau furtif
     # mourait en TypeError avant d'ouvrir un navigateur.
     assert stealthy.calls[0][1]["retries"] >= 1
+
+
+def test_stealthy_browser_is_serialized_when_two_pages_need_it():
+    """Deux echecs rapides ne doivent pas ouvrir deux Chromium en parallele."""
+    stealthy = BlockingStealthy(response())
+    fetcher = PageFetcher(
+        fast=Fast(response("<html><body>court</body></html>")),
+        stealthy=stealthy,
+        rate_limit_delay=0,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(fetcher.fetch, "https://maker.example/one")
+        assert stealthy.started.wait(timeout=1)
+        second = executor.submit(fetcher.fetch, "https://maker.example/two")
+        assert not stealthy.second_started.wait(timeout=0.2)
+        stealthy.release.set()
+        assert first.result().mode == "stealthy"
+        assert second.result().mode == "stealthy"
+
+    assert len(stealthy.calls) == 2
 
 
 def test_fast_exception_is_logged_without_stopping_the_ladder(caplog):
@@ -245,6 +285,33 @@ def test_safe_head_identity_is_preserved_without_importing_arbitrary_scripts():
     assert "4KBL137001R1110" in page.content
     assert "DESCRIPTION_NON_AUTORISEE" not in page.content
     assert "NE_DOIT_PAS_SORTIR" not in page.content
+
+
+def test_safe_head_identity_preserves_nested_brand_role():
+    body = "Technical product data for the selected item. " * 8
+    html = f"""
+    <html><head>
+      <title>ZX-41-7 | Example Shop</title>
+      <script type="application/ld+json">
+        {{
+          "@type": "Product",
+          "name": "ZX-41-7",
+          "mpn": "ZX-41-7",
+          "brand": {{"@type": "Brand", "name": "Maker"}},
+          "seller": {{"@type": "Organization", "name": "Example Shop"}}
+        }}
+      </script>
+    </head><body><main>{body}</main></body></html>
+    """
+
+    page = PageFetcher(
+        fast=Fast(response(html)),
+        stealthy=Stealthy(error=AssertionError("ne doit pas être appelé")),
+        rate_limit_delay=0,
+    ).fetch("https://example-shop.test/products/zx-41-7")
+
+    assert "jsonld.brand.name: Maker" in page.content
+    assert "jsonld.seller.name: Example Shop" in page.content
 
 
 def test_rate_limiter_spaces_shared_attempts():

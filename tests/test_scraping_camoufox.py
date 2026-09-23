@@ -84,6 +84,23 @@ def test_a_403_on_both_rungs_calls_camoufox():
     assert "bobine 24 V DC" in page.content
 
 
+def test_camoufox_is_not_automatic_without_an_explicit_fetcher():
+    """Le navigateur tiers peut bloquer hors de son timeout ; il est opt-in."""
+    fetcher = PageFetcher(
+        fast=_Fetcher(_reponse(status=403)),
+        stealthy=_Fetcher(_reponse(status=403)),
+        rate_limit_delay=0,
+    )
+    fetcher._camoufox_fetcher = lambda: (_ for _ in ()).throw(
+        AssertionError("Camoufox ne doit pas demarrer automatiquement")
+    )
+
+    with pytest.raises(PageFetchError) as raised:
+        fetcher.fetch("https://distributeur.example/ref")
+
+    assert [item.mode for item in raised.value.attempts] == ["scrapling", "stealthy"]
+
+
 def test_camoufox_is_not_called_when_the_page_is_merely_empty():
     """Le mode le plus lent ne doit pas servir là où il n'apporte rien."""
     vide = _reponse("<html><body><main>court</main></body></html>")

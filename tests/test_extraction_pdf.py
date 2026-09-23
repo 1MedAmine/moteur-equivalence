@@ -38,6 +38,9 @@ class FakeDocument:
     def __iter__(self):
         return iter(self.pages)
 
+    def __len__(self) -> int:
+        return len(self.pages)
+
     def close(self) -> None:
         self.closed = True
 
@@ -97,6 +100,26 @@ def test_camelot_is_skipped_without_detected_table(tmp_path):
         "Fiche constructeur",
         (),
     )
+
+
+def test_large_catalogue_keeps_literal_text_without_running_camelot(tmp_path):
+    """Un catalogue ne monopolise pas le run pour enrichir ses centaines de tableaux."""
+    pages = [FakePage(f"Page {index}", True) for index in range(1, 34)]
+    document = FakeDocument(pages)
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("Camelot ne doit pas ouvrir un catalogue trop long")
+
+    result = extract_pdf(
+        tmp_path / "catalogue.pdf",
+        document_opener=lambda _: document,
+        table_reader=must_not_run,
+    )
+
+    assert "[PAGE page=1]\nPage 1\n[/PAGE]" in result.text
+    assert "[PAGE page=33]\nPage 33\n[/PAGE]" in result.text
+    assert [page.table_calls for page in pages] == [0] * 33
+    assert result.warnings == ("Camelot: skipped_large_document",)
 
 
 def test_table_cells_keep_page_row_and_column_coordinates(tmp_path):

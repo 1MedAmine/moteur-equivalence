@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 import robustesse
+from routage_searx import ENGINE_SHORTCUTS, SUPPORTED_ENGINE_SHORTCUTS
 
 
 DOSSIER = Path(__file__).resolve().parent
@@ -24,16 +25,31 @@ FICHIER_ENV = DOSSIER / ".env"
 MAX_LOGICAL_QUERIES = 12
 MAX_QUERIES_PER_WAVE = 3
 
-DEFAULT_DISTRIBUTOR_DOMAINS = (
-    "distributeur-a.example",
-    "distributeur-b.example",
-    "distributeur-c.example",
-    "distributeur-d.example",
-)
+# Aucun domaine factice ne doit atteindre un moteur de recherche réel. Les
+# distributeurs sont une option de déploiement explicite via
+# ``B2_DISTRIBUTOR_DOMAINS`` ; l'absence de configuration désactive cet angle.
+DEFAULT_DISTRIBUTOR_DOMAINS: tuple[str, ...] = ()
+_NON_ROUTABLE_TEST_TLDS = (".example", ".invalid", ".test", ".localhost")
 
 
 class ConfigurationIncomplete(ValueError):
     """Erreur de configuration sûre et destinée à l'utilisateur."""
+
+
+def _search_engine_shortcuts() -> tuple[str, ...]:
+    raw = os.getenv("B2_SEARCH_ENGINE_SHORTCUTS", "").strip()
+    if not raw:
+        return ENGINE_SHORTCUTS
+    shortcuts = tuple(item.strip().casefold() for item in raw.split(","))
+    if (
+        not shortcuts
+        or any(not item or item not in SUPPORTED_ENGINE_SHORTCUTS for item in shortcuts)
+        or len(set(shortcuts)) != len(shortcuts)
+    ):
+        raise ConfigurationIncomplete(
+            "B2_SEARCH_ENGINE_SHORTCUTS contient un raccourci inconnu ou répété."
+        )
+    return shortcuts
 
 
 def _premier_non_vide(*noms: str, defaut: str = "") -> str:
@@ -147,9 +163,11 @@ def _domaines(nom: str, defaut: tuple[str, ...]) -> tuple[str, ...]:
             raise ConfigurationIncomplete(
                 f"{nom} doit contenir des noms de domaine separes par des virgules."
             )
+        if valeur == "localhost" or valeur.endswith(_NON_ROUTABLE_TEST_TLDS):
+            continue
         if valeur not in domaines:
             domaines.append(valeur)
-    if not domaines:
+    if not domaines and defaut:
         raise ConfigurationIncomplete(f"{nom} doit contenir au moins un domaine.")
     return tuple(domaines)
 
@@ -160,9 +178,9 @@ class B2Config:
     api_base: str = "https://integrate.api.nvidia.com/v1"
     model: str = "nvidia/nemotron-3-super-120b-a12b"
     vision_model: str = "nvidia/nemotron-nano-12b-v2-vl"
-    enable_thinking: bool = False
-    reasoning_budget: int = 4096
-    temperature: float = 1.0
+    enable_thinking: bool = True
+    reasoning_budget: int = 8192
+    temperature: float = 0.1
     llm_timeout: float = 180.0
     network_timeout: float = 25.0
     model_tokens: int = 256_000
@@ -183,6 +201,7 @@ class B2Config:
     adaptive_max_waves: int = 4
     adaptive_queries_per_wave: int = MAX_QUERIES_PER_WAVE
     adaptive_engine_attempts: int = 3
+    search_engine_shortcuts: tuple[str, ...] = ENGINE_SHORTCUTS
     adaptive_pages_per_wave: int = 12
     min_compatibility_percent: int = 75
     searxng_url: str = "http://localhost:8080"
@@ -201,7 +220,7 @@ class B2Config:
         if env_file is not None and env_file.exists():
             load_dotenv(env_file, override=False)
 
-        temperature = _flottant("B2_TEMPERATURE", 1.0, minimum=0.0, maximum=2.0)
+        temperature = _flottant("B2_TEMPERATURE", 0.1, minimum=0.0, maximum=2.0)
         max_waves = _entier("B2_ADAPTIVE_MAX_WAVES", 4, minimum=1, maximum=4)
         queries = _entier(
             "B2_ADAPTIVE_QUERIES_PER_WAVE",
@@ -246,8 +265,8 @@ class B2Config:
             vision_model=_texte(
                 "B2_VISION_MODEL", "nvidia/nemotron-nano-12b-v2-vl"
             ),
-            enable_thinking=_booleen("B2_ENABLE_THINKING", False),
-            reasoning_budget=_entier("B2_REASONING_BUDGET", 4096, minimum=1),
+            enable_thinking=_booleen("B2_ENABLE_THINKING", True),
+            reasoning_budget=_entier("B2_REASONING_BUDGET", 8192, minimum=1),
             temperature=temperature,
             llm_timeout=_flottant(
                 "B2_LLM_TIMEOUT",
@@ -278,6 +297,7 @@ class B2Config:
             adaptive_max_waves=max_waves,
             adaptive_queries_per_wave=queries,
             adaptive_engine_attempts=engine_attempts,
+            search_engine_shortcuts=_search_engine_shortcuts(),
             adaptive_pages_per_wave=pages,
             min_compatibility_percent=threshold,
             searxng_url=_url("B2_SEARXNG_URL", searxng_url),
@@ -310,17 +330,35 @@ def _payload_raisonnement(config: B2Config) -> dict:
     }
 
 
-def config_llm(config: B2Config | None = None) -> dict:
+def config_llm(
+    config: B2Config | None = None,
+    *,
+    structured_output: bool = False,
+) -> dict:
     config = config or B2Config.from_env()
     resultat = {
         "model": f"openai/{config.model}",
         "api_key": config.api_key,
         "base_url": config.api_base,
-        "temperature": config.temperature,
+        "temperature": 0.0 if structured_output else config.temperature,
         "timeout": config.llm_timeout,
+        # La reprise est gérée au niveau du graphe, avec une erreur
+        # diagnostiquable. Laisser ChatOpenAI effectuer ses reprises cachées
+        # pouvait bloquer un run pendant plusieurs timeouts successifs.
+        "max_retries": 0,
         "model_tokens": config.model_tokens,
     }
     extra = _payload_raisonnement(config)
+    if structured_output and any(
+        model in config.model
+        for model in ("nemotron-3-super", "nemotron-3-ultra")
+    ):
+        # ScrapeGraphAI valide ces appels contre un schéma Pydantic. Le canal
+        # de raisonnement de Nemotron peut alors devenir la valeur parsée et
+        # faire disparaître les clés attendues (`criteria`, `candidates`).
+        # La planification directe conserve le budget de raisonnement ; seuls
+        # les appels qui doivent rendre un JSON contractuel le désactivent.
+        extra = {"chat_template_kwargs": {"enable_thinking": False}}
     if extra:
         resultat["extra_body"] = extra
     return resultat
@@ -329,7 +367,7 @@ def config_llm(config: B2Config | None = None) -> dict:
 def config_graphe(config: B2Config | None = None, **surcharges) -> dict:
     config = config or B2Config.from_env()
     resultat = {
-        "llm": config_llm(config),
+        "llm": config_llm(config, structured_output=True),
         "verbose": config.verbose,
         "headless": config.headless,
         "timeout": config.network_timeout,

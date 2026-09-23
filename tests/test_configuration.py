@@ -34,6 +34,7 @@ _VARIABLES = {
     "B2_ADAPTIVE_MAX_WAVES",
     "B2_ADAPTIVE_QUERIES_PER_WAVE",
     "B2_ADAPTIVE_ENGINE_ATTEMPTS",
+    "B2_SEARCH_ENGINE_SHORTCUTS",
     "B2_ADAPTIVE_PAGES_PER_WAVE",
     "B2_MIN_COMPATIBILITY_PERCENT",
     "B2_SEARXNG_URL",
@@ -63,9 +64,9 @@ def test_les_budgets_par_defaut_restent_ceux_valides(monkeypatch, tmp_path):
     config = configuration.B2Config.from_env(tmp_path / "absent.env")
 
     assert config.model == "nvidia/nemotron-3-super-120b-a12b"
-    assert config.temperature == 1.0
-    assert config.enable_thinking is False
-    assert config.reasoning_budget == 4096
+    assert config.temperature == 0.1
+    assert config.enable_thinking is True
+    assert config.reasoning_budget == 8192
     assert config.llm_timeout == 180.0
     assert config.network_timeout == 25.0
     assert config.max_scraper_workers == 2
@@ -86,13 +87,26 @@ def test_default_distributor_domains_are_readable_multibrand_sources(
 
     config = configuration.B2Config.from_env(tmp_path / "absent.env")
 
-    assert config.distributor_domains == (
-        "distributeur-a.example",
-        "distributeur-b.example",
-        "distributeur-c.example",
-        "distributeur-d.example",
-    )
-    assert "distri-b.example" not in config.distributor_domains
+    assert config.distributor_domains == ()
+
+
+def test_search_engines_can_use_an_available_alternative_without_changing_defaults(
+    monkeypatch, tmp_path
+):
+    _clear(monkeypatch)
+    monkeypatch.setenv("B2_SEARCH_ENGINE_SHORTCUTS", "yd,szn,nvr")
+
+    config = configuration.B2Config.from_env(tmp_path / "absent.env")
+
+    assert config.search_engine_shortcuts == ("yd", "szn", "nvr")
+
+
+def test_unknown_search_engine_shortcut_fails_closed(monkeypatch, tmp_path):
+    _clear(monkeypatch)
+    monkeypatch.setenv("B2_SEARCH_ENGINE_SHORTCUTS", "yd,unknown")
+
+    with pytest.raises(configuration.ConfigurationIncomplete):
+        configuration.B2Config.from_env(tmp_path / "absent.env")
 
 
 def test_distributor_domains_can_be_overridden_without_a_brand_rule(
@@ -101,15 +115,29 @@ def test_distributor_domains_can_be_overridden_without_a_brand_rule(
     _clear(monkeypatch)
     monkeypatch.setenv(
         "B2_DISTRIBUTOR_DOMAINS",
-        " catalogue-a.example , catalogue-b.example ",
+        " catalogue-a.com , catalogue-b.net ",
     )
 
     config = configuration.B2Config.from_env(tmp_path / "absent.env")
 
     assert config.distributor_domains == (
-        "catalogue-a.example",
-        "catalogue-b.example",
+        "catalogue-a.com",
+        "catalogue-b.net",
     )
+
+
+def test_reserved_example_domains_are_never_sent_to_live_search(
+    monkeypatch, tmp_path
+):
+    _clear(monkeypatch)
+    monkeypatch.setenv(
+        "B2_DISTRIBUTOR_DOMAINS",
+        "distributeur-a.example, distributeur-b.invalid, catalogue.test",
+    )
+
+    config = configuration.B2Config.from_env(tmp_path / "absent.env")
+
+    assert config.distributor_domains == ()
 
 
 @pytest.mark.parametrize(
@@ -175,8 +203,32 @@ def test_llm_payload_matches_nemotron_contract(monkeypatch, tmp_path):
     payload = configuration.config_llm(config)
 
     assert payload["model"] == "openai/nvidia/nemotron-3-super-120b-a12b"
-    assert payload["temperature"] == 1.0
+    assert payload["temperature"] == 0.1
     assert payload["timeout"] == 180.0
+    assert payload["max_retries"] == 0
     assert payload["extra_body"] == {
-        "chat_template_kwargs": {"enable_thinking": False}
+        "reasoning_budget": 8192,
+        "chat_template_kwargs": {"enable_thinking": True, "low_effort": False},
     }
+
+
+def test_structured_graph_disables_thinking_but_keeps_it_for_planning():
+    config = configuration.B2Config(
+        api_key="test-only-key",
+        enable_thinking=True,
+        reasoning_budget=8192,
+        temperature=0.1,
+    )
+
+    planning = configuration.config_llm(config)
+    structured = configuration.config_graphe(config, verbose=False)["llm"]
+
+    assert planning["extra_body"] == {
+        "reasoning_budget": 8192,
+        "chat_template_kwargs": {"enable_thinking": True, "low_effort": False},
+    }
+    assert planning["temperature"] == 0.1
+    assert structured["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    assert structured["temperature"] == 0.0

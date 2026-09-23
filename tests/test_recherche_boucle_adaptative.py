@@ -129,7 +129,10 @@ class _PlannerLarge(_Planner):
 class _PlannerWithDistributorQueries(_Planner):
     def __init__(self) -> None:
         super().__init__()
-        self.config = B2Config(api_key="test")
+        self.config = B2Config(
+            api_key="test",
+            distributor_domains=("distributeur-a.example",),
+        )
 
     plan_distributor_queries = Planner.plan_distributor_queries
 
@@ -137,7 +140,11 @@ class _PlannerWithDistributorQueries(_Planner):
 def test_targeted_wave_sends_a_distributor_query_after_a_lead_is_discovered():
     gateway = _GatewayUrlsDistinctes()
     service = AdaptiveResearch(
-        config=B2Config(api_key="test", adaptive_max_waves=2),
+        config=B2Config(
+            api_key="test",
+            adaptive_max_waves=2,
+            distributor_domains=("distributeur-a.example",),
+        ),
         planner=_PlannerWithDistributorQueries(),
         gateway=gateway,
         fetcher=_Fetcher(),

@@ -34,6 +34,23 @@ _SPEC_RE = re.compile(
     r")(?![\w])",
     flags=re.IGNORECASE,
 )
+_NAMED_SPEC_RE = re.compile(
+    r"^\s*(?P<label>[^:\n]{1,100}?)\s*:\s*(?P<value>[^:\n]{1,200}?)\s*$"
+)
+_CATEGORICAL_DISCRIMINANT_LABELS = frozenset({
+    "etancheite",
+    "jeuinterne",
+    "jeuinterneradial",
+    "radialinternalclearance",
+    "sealing",
+})
+_BOTH_SIDES_SEALING_RE = re.compile(
+    r"\b(?:"
+    r"(?:with\s+)?seals?\s+on\s+both\s+sides"
+    r"|sealed\s+(?:on\s+)?both\s+sides"
+    r")\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +143,37 @@ def _specs(value: str) -> list[tuple[str, str]]:
     return found
 
 
+def _categorical_spec(line: str) -> tuple[str, str, str] | None:
+    match = _NAMED_SPEC_RE.fullmatch(line.strip())
+    if match is None:
+        return None
+    label = match.group("label").strip()
+    value = match.group("value").strip()
+    if _normaliser(label) not in _CATEGORICAL_DISCRIMINANT_LABELS:
+        return None
+    if not value or _cellule_corrompue(value):
+        return None
+    return label, value, f"{label}: {value}"
+
+
+def _categorical_specs(line: str) -> tuple[tuple[str, str, str], ...]:
+    """Repère aussi une étanchéité explicite écrite dans une désignation.
+
+    Les fiches courtes mettent fréquemment « with seals on both sides » dans
+    la description, sans champ `Sealing`. C'est une propriété discriminante
+    littérale : elle doit déclencher la seconde passe si le modèle initial la
+    néglige. La valeur reste le groupe exact extrait de la fiche.
+    """
+    found: list[tuple[str, str, str]] = []
+    named = _categorical_spec(line)
+    if named is not None:
+        found.append(named)
+    for match in _BOTH_SIDES_SEALING_RE.finditer(line):
+        value = match.group(0).strip()
+        found.append(("Sealing", value, f"Sealing: {value}"))
+    return tuple(found)
+
+
 def neutraliser_source_initiale(fiche: str) -> str:
     """Masque les glyphes illisibles avant le premier appel structuré.
 
@@ -177,6 +225,11 @@ def evaluer_couverture(
     )
     requirement_specs = {
         _normaliser(spec) for spec in specifications_evidentes(requirement_text)
+    }
+    requirement_categorical = {
+        (_normaliser(item.label), _normaliser(item.requested_value))
+        for item in requirements.criteria
+        if _normaliser(item.label) in _CATEGORICAL_DISCRIMINANT_LABELS
     }
     table_matches = list(_TABLE_RE.finditer(fiche))
     table_geometry = {
@@ -272,6 +325,13 @@ def evaluer_couverture(
                     continue
                 found.append((spec, context, page, None, None))
 
+    categorical_found: list[tuple[str, str, str, int | None]] = []
+    for page_match in page_matches:
+        page = int(page_match.group("page"))
+        for line in page_match.group("body").splitlines():
+            for label, value, context in _categorical_specs(line):
+                categorical_found.append((label, value, context, page))
+
     outside_pages: list[str] = []
     cursor = 0
     for page_match in page_matches:
@@ -284,6 +344,8 @@ def evaluer_couverture(
             if key in sibling_table_values and key not in allowed_table_values:
                 continue
             found.append((spec, context, None, None, None))
+        for label, value, context in _categorical_specs(line):
+            categorical_found.append((label, value, context, None))
 
     unique_found: list[
         tuple[str, str, str, int | None, int | None, int | None]
@@ -328,8 +390,28 @@ def evaluer_couverture(
         seen_corrupted.add(identity)
         orphans.append(item)
 
+    seen_categorical: set[tuple[str, str]] = set()
+    covered_categorical = 0
+    for label, value, context, page in categorical_found:
+        identity = (_normaliser(label), _normaliser(value))
+        if not all(identity) or identity in seen_categorical:
+            continue
+        seen_categorical.add(identity)
+        if identity in requirement_categorical:
+            covered_categorical += 1
+            continue
+        orphans.append(CoverageOrphan(
+            value=value,
+            label=label,
+            context=context,
+            reason="missing_categorical_spec",
+            page=page,
+        ))
+
     return CoverageAssessment(
-        detected_specs=len(unique_found) + len(seen_corrupted),
-        covered_specs=covered,
+        detected_specs=(
+            len(unique_found) + len(seen_corrupted) + len(seen_categorical)
+        ),
+        covered_specs=covered + covered_categorical,
         orphans=tuple(orphans),
     )

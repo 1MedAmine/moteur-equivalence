@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 
 ENGINE_SHORTCUTS = ("bi", "ddg", "goc", "nvr", "szn", "qw", "sp")
+SUPPORTED_ENGINE_SHORTCUTS = (*ENGINE_SHORTCUTS, "yd")
 _BANG_TOKEN = re.compile(r"(?<!\S)![A-Za-z0-9_.-]+(?=\s|$)")
 
 

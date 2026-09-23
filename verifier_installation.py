@@ -142,6 +142,12 @@ def controle_recherche() -> bool:
 
 
 def main() -> int:
+    # Les messages accentues n'ont pas besoin d'un contrat JSON, mais la page
+    # de code historique de Windows (souvent CP1252) les imprime tout aussi
+    # mal : meme correctif que `cli.py` et `rejouer.py`.
+    reconfigurer = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigurer):
+        reconfigurer(encoding="utf-8")
     analyseur = argparse.ArgumentParser(description=__doc__)
     analyseur.add_argument(
         "--hors-ligne",

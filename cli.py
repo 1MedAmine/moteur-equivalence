@@ -111,6 +111,14 @@ def executer(entree: dict) -> dict:
 
 
 def main() -> int:
+    # Le contrat est un JSON UTF-8 sur stdin et sur stdout. Sur Windows, la
+    # page de code historique (souvent CP1252) ne lit ni n'imprime tout
+    # Unicode : mêmes symptômes, mêmes deux flux à reconfigurer que
+    # `rejouer.py`.
+    for flux in (sys.stdin, sys.stdout):
+        reconfigurer = getattr(flux, "reconfigure", None)
+        if callable(reconfigurer):
+            reconfigurer(encoding="utf-8")
     try:
         entree = json.load(sys.stdin)
         resultat = executer(entree)

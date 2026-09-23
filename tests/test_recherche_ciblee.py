@@ -28,7 +28,13 @@ from modeles import (
     SearchHit,
     SourceProof,
 )
-from planification import PlanningError, QueryPlan, TargetedQuery, TargetedQueryPlan
+from planification import (
+    PlanningError,
+    QueryPlan,
+    SearchCandidateHint,
+    TargetedQuery,
+    TargetedQueryPlan,
+)
 from recherche_adaptative import (
     MAX_LOGICAL_QUERIES,
     AdaptiveResearch,
@@ -158,10 +164,10 @@ def test_cached_product_pages_resolves_nested_audited_and_active_candidate_keys(
 
 def test_select_hit_contexts_counts_a_canonical_duplicate_once_and_unions_context():
     """Deux requêtes ciblées vers la même page autorisent leurs deux pistes."""
-    duplicate = "https://maker.com/product?utm_source=search"
+    duplicate = "https://maker.com/product/zx417-qk900?utm_source=search"
     batches = [
         _batch("query-1", [duplicate]),
-        _batch("query-2", ["https://maker.com/product#details"]),
+        _batch("query-2", ["https://maker.com/product/zx417-qk900#details"]),
     ]
     keys = {
         "query-1": (("maker", "zx417"),),
@@ -183,7 +189,7 @@ def test_select_hit_contexts_counts_a_canonical_duplicate_once_and_unions_contex
         ("maker", "qk900"),
     )
     assert len(selected[0].hits) == 2
-    assert seen_urls == {"https://maker.com/product"}
+    assert seen_urls == {"https://maker.com/product/zx417-qk900"}
 
 
 def test_select_hit_contexts_uses_numeric_rank_when_query_ranks_are_sparse():
@@ -229,6 +235,58 @@ def test_select_hit_contexts_uses_numeric_rank_when_query_ranks_are_sparse():
         "https://maker.com/query-2-rank-1",
         "https://maker.com/query-1-rank-2",
         "https://maker.com/query-2-rank-3",
+    ]
+
+
+def test_targeted_hit_without_candidate_reference_is_not_opened():
+    contexts = [[HitContext(
+        wave=2,
+        query="Maker ZX-41-7 fiche produit",
+        candidate_keys=(("maker", "zx417"),),
+        hit=SearchHit(
+            url="https://unrelated.example/products/bearing-latest",
+            title="Unrelated news",
+            snippet="No product identity here",
+            engine="bing",
+            rank=1,
+        ),
+    )]]
+
+    assert select_hit_contexts(contexts, seen_urls=set(), limit=12) == []
+
+
+def test_discovery_hit_must_repeat_a_numeric_anchor_or_two_query_terms():
+    contexts = [[
+        HitContext(
+            wave=1,
+            query="deep groove ball bearing 25x52x15 sealed",
+            candidate_keys=(),
+            hit=SearchHit(
+                url="https://sports.example/season-2026",
+                title="Football season",
+                snippet="Latest standings",
+                engine="bing",
+                rank=1,
+            ),
+        ),
+        HitContext(
+            wave=1,
+            query="deep groove ball bearing 25x52x15 sealed",
+            candidate_keys=(),
+            hit=SearchHit(
+                url="https://catalog.example/bearing-25x52x15",
+                title="Deep groove ball bearing 25x52x15",
+                snippet="Sealed bearing product page",
+                engine="bing",
+                rank=2,
+            ),
+        ),
+    ]]
+
+    selected = select_hit_contexts(contexts, seen_urls=set(), limit=12)
+
+    assert [item.url for item in selected] == [
+        "https://catalog.example/bearing-25x52x15"
     ]
 
 
@@ -288,7 +346,11 @@ def _requirements() -> RequirementSet:
             Requirement(
                 id=f"r{index}",
                 label=f"Criterion {index}",
-                requested_value=f"v{index}",
+                # Litteralement ce que porte l'extrait par defaut de
+                # `_candidate` (`f"proof for r {index}"`) et le contenu par
+                # defaut de `_Fetcher` : une valeur placeholder doit rester
+                # trouvable dans sa propre preuve.
+                requested_value=f"r {index}",
                 critical=True,
             )
             for index in range(1, 5)
@@ -309,8 +371,8 @@ def _candidate(
         criteria=[
             CriterionAudit(
                 requirement_id=f"r{index}",
-                requested_value=f"v{index}",
-                observed_value=f"v{index}" if status != "not_proven" else "",
+                requested_value=f"r {index}",
+                observed_value=f"r {index}" if status != "not_proven" else "",
                 status=status,
                 proofs=[
                     SourceProof(
@@ -600,6 +662,116 @@ def test_run_switches_from_discovery_to_targeted_queries_with_page_authorization
         "reference": "",
         "reason": "malformed_proposal",
     }]
+
+
+def test_all_search_metadata_leads_are_targeted_even_when_only_one_page_is_opened():
+    identities = (
+        ("MakerA", "ZX-417"),
+        ("MakerB", "QK-900"),
+        ("MakerC", "RT200X"),
+        ("MakerD", "LM-400"),
+    )
+
+    class MetadataGateway:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def search(self, query: str) -> SearchBatch:
+            self.calls.append(query)
+            hits = []
+            if len(self.calls) == 1:
+                hits = [
+                    SearchHit(
+                        url=f"https://distributor.example/item-{index}",
+                        title=f"{brand} {reference} Source product",
+                        snippet=f"{brand} {reference} technical product page",
+                        engine="bing",
+                        rank=index,
+                    )
+                    for index, (brand, reference) in enumerate(identities, start=1)
+                ]
+            return SearchBatch(
+                query=query,
+                hits=hits,
+                attempts=[SearchAttempt(
+                    engine="bing",
+                    status="ok" if hits else "empty",
+                    result_count=len(hits),
+                )],
+            )
+
+    planner = _Planner()
+    gateway = MetadataGateway()
+    fetcher = _Fetcher(identity_metadata=False)
+    analyzer = _Analyzer(_empty_analyses)
+    service = AdaptiveResearch(
+        config=B2Config(
+            api_key="test",
+            adaptive_max_waves=2,
+            adaptive_pages_per_wave=1,
+        ),
+        planner=planner,
+        gateway=gateway,
+        fetcher=fetcher,
+        analyze_pages=analyzer,
+        graph_config={},
+    )
+
+    service.run("source sheet", None)
+
+    assert len(fetcher.calls) == 1
+    assert len(planner.targeted_calls) == 1
+    assert {
+        (lead.brand, lead.reference)
+        for lead in planner.targeted_calls[0]["candidates"]
+    } == set(identities)
+
+
+def test_llm_search_hints_override_noisy_metadata_before_targeted_planning():
+    class HintPlanner(_Planner):
+        def discover_search_candidates(self, requirement_set, hits, target_brand):
+            return (
+                SearchCandidateHint(
+                    result_index=0,
+                    brand="Maker",
+                    reference="ZX-417",
+                ),
+            )
+
+    class NoisyGateway:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def search(self, query: str) -> SearchBatch:
+            self.calls.append(query)
+            hits = []
+            if len(self.calls) == 1:
+                hits = [SearchHit(
+                    url="https://distributor.example/zx-417",
+                    title="Technical review Maker ZX-417 product page",
+                    snippet="Maker ZX-417 exact model",
+                    engine="bing",
+                    rank=1,
+                )]
+            return SearchBatch(query=query, hits=hits)
+
+    planner = HintPlanner()
+    service = AdaptiveResearch(
+        config=B2Config(api_key="test", adaptive_max_waves=2),
+        planner=planner,
+        gateway=NoisyGateway(),
+        fetcher=_Fetcher(identity_metadata=False),
+        analyze_pages=_Analyzer(_empty_analyses),
+        graph_config={},
+    )
+
+    service.run("source sheet", None)
+
+    assert len(planner.targeted_calls) == 1
+    assert (
+        planner.targeted_calls[0]["candidates"][0].brand,
+        planner.targeted_calls[0]["candidates"][0].reference,
+    ) == ("Maker", "ZX-417")
 
 
 def test_targeted_planning_receives_up_to_four_active_leads():
@@ -1020,7 +1192,11 @@ def test_targeted_planning_failure_falls_back_once_to_general_with_safe_warning(
         "targeted",
         "discovery",
     ]
-    assert analyzer.calls[1]["authorized_by_url"] == {}
+    assert analyzer.calls[1]["authorized_by_url"]
+    assert all(
+        leads[0].reference == "ZX-41-7"
+        for leads in analyzer.calls[1]["authorized_by_url"].values()
+    )
     # Onze et non douze : la vague ciblée n'envoie que deux requêtes, le quota
     # d'angles de l'unique piste valant deux. Le plafond global reste douze.
     assert outcome.diagnostics.logical_queries == len(gateway.calls) == 11
@@ -1278,25 +1454,41 @@ def test_merge_drops_page_annotations_when_any_conclusive_verdict_loses():
     assert merged[0].candidates[0].deviations == []
 
 
+def _content_for(statuses, *, extra: str = "") -> str:
+    """Contenu de page assorti a ce que `statuses` prouve reellement.
+
+    Le contenu par defaut de `_Fetcher` porte les quatre `proof for r N` sans
+    condition ; laisser cette phrase pour un critere volontairement
+    `not_proven` le ferait retrouver par le reaudit des pages officielles.
+    """
+    phrases = " ".join(
+        f"proof for r {index}" for index, status in enumerate(statuses, start=1)
+        if status != "not_proven"
+    )
+    return (
+        f"Maker ZX-41-7 technical data {phrases} "
+        + ("bounded corpus text " * 20)
+        + extra
+    )
+
+
 def test_partial_best_candidate_uses_candidate_selected_final_state():
     def handler(call_number: int, call: dict) -> list[PageAnalysis]:
         if call_number > 1:
             return _empty_analyses(call_number, call)
         page = call["pages"][0]
+        statuses = ("proven", "proven", "proven", "not_proven")
         return [PageAnalysis(
             page_url=page.url,
-            content=page.content,
+            content=_content_for(statuses),
             audit=PageAudit(
                 page_url=page.url,
-                candidates=[_candidate(
-                    page.url,
-                    ("proven", "proven", "proven", "not_proven"),
-                )],
+                candidates=[_candidate(page.url, statuses)],
             ),
             mode=call["mode"],
         )]
 
-    service, _, _, _, _ = _service(analyzer=_Analyzer(handler))
+    service, _, _, _, _ = _service(analyzer=_Analyzer(handler), fetcher=_Fetcher(identity_metadata=False))
 
     outcome = service.run("source sheet", "Maker")
 
@@ -1326,7 +1518,7 @@ def test_invented_excerpt_is_downgraded_and_never_counts_as_proven():
             ("not_proven",) * 4,
             reference="QK-900",
         )
-        content = page.content + " Maker QK-900"
+        content = _content_for(("not_proven",) * 4, extra=" Maker QK-900")
         return [PageAnalysis(
             page_url=page.url,
             content=content,
@@ -1337,7 +1529,7 @@ def test_invented_excerpt_is_downgraded_and_never_counts_as_proven():
             mode=call["mode"],
         )]
 
-    service, _, _, _, _ = _service(analyzer=_Analyzer(handler))
+    service, _, _, _, _ = _service(analyzer=_Analyzer(handler), fetcher=_Fetcher(identity_metadata=False))
 
     outcome = service.run("source sheet", "Maker")
 
@@ -1364,9 +1556,12 @@ def test_candidate_selected_outranks_a_neighbour_with_unverifiable_proof():
             ("proven", "proven", "proven", "not_proven"),
             reference="QK-900",
         )
+        content = _content_for(
+            ("proven", "proven", "proven", "not_proven"), extra=" Maker QK-900"
+        )
         return [PageAnalysis(
             page_url=page.url,
-            content=page.content + " Maker QK-900",
+            content=content,
             audit=PageAudit(
                 page_url=page.url,
                 candidates=[invalid, eligible],
@@ -1374,7 +1569,7 @@ def test_candidate_selected_outranks_a_neighbour_with_unverifiable_proof():
             mode=call["mode"],
         )]
 
-    service, _, _, _, _ = _service(analyzer=_Analyzer(handler))
+    service, _, _, _, _ = _service(analyzer=_Analyzer(handler), fetcher=_Fetcher(identity_metadata=False))
 
     outcome = service.run("source sheet", "Maker")
 
@@ -1389,17 +1584,18 @@ def test_post_filter_candidate_without_strict_error_is_audited_but_non_verifiabl
         if call_number > 1:
             return _empty_analyses(call_number, call)
         page = call["pages"][0]
+        statuses = ("not_proven",) * 4
         return [PageAnalysis(
             page_url=page.url,
-            content=page.content,
+            content=_content_for(statuses),
             audit=PageAudit(
                 page_url=page.url,
-                candidates=[_candidate(page.url, ("not_proven",) * 4)],
+                candidates=[_candidate(page.url, statuses)],
             ),
             mode=call["mode"],
         )]
 
-    service, _, _, _, _ = _service(analyzer=_Analyzer(handler))
+    service, _, _, _, _ = _service(analyzer=_Analyzer(handler), fetcher=_Fetcher(identity_metadata=False))
 
     outcome = service.run("source sheet", "Maker")
 

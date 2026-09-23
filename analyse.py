@@ -24,14 +24,17 @@ import robustesse
 from candidats import (
     CandidateLead,
     CandidateProposal,
+    DeclaredCandidateCriteriaEnvelope,
     DiscoveryDocument,
     DiscoveryEnvelope,
     PageAuditEnvelope,
     RejectedCandidate,
     build_discovery_document,
+    confirmed_candidate_leads,
     filter_page_audit,
     parse_candidate_proposals,
 )
+from compatibilite import criteres_notables
 from mission import Alternative
 from mission import construire_mission_audit, construire_mission_decouverte
 from modeles import CandidateAudit, CriterionAudit, PageAudit, RequirementSet
@@ -67,16 +70,16 @@ class PageAuditExtractionError(ValueError):
 
 
 _PAGE_AUDIT_PATH = re.compile(
-    r"(?:\$|page_url|candidates(?:\[\d+\])?"
+    r"(?:\$|page_url|(?:candidates|candidate_criteria)(?:\[\d+\])?"
     r"(?:\.(?:brand|reference|criteria|deviations|limitations|"
-    r"requirement_id|requested_value|observed_value|status|proofs|"
+    r"candidate_index|requirement_id|requested_value|observed_value|status|proofs|"
     r"url|excerpt|type)(?:\[\d+\])?)*)"
 )
 _PAGE_AUDIT_ISSUES = frozenset({
-    "invalid_item", "invalid_structure", "json_parse_error",
+    "empty_declared_audit", "invalid_item", "invalid_structure", "json_parse_error",
 })
 _PAGE_AUDIT_ACTIONS = frozenset({
-    "aborted", "discarded", "retried", "retry_failed",
+    "aborted", "defaulted_not_proven", "discarded", "retried", "retry_failed",
 })
 
 
@@ -466,6 +469,150 @@ def _validate_page_audit_items(
     return PageAudit(page_url=page_url, candidates=valid_candidates)
 
 
+def _validate_declared_candidate_criteria(
+    payload: object,
+    *,
+    page_url: str,
+    requirements: RequirementSet,
+    declared_candidates: Sequence[CandidateLead],
+    diagnostics: list[dict[str, str]],
+) -> PageAudit:
+    if isinstance(payload, BaseModel):
+        payload = payload.model_dump()
+    if not isinstance(payload, Mapping):
+        raise PageAuditExtractionError({
+            "stage": "page_audit",
+            "path": "$",
+            "issue": "invalid_structure",
+            "action": "aborted",
+        }) from None
+    raw_groups = payload.get("candidate_criteria")
+    if not isinstance(raw_groups, list):
+        raise PageAuditExtractionError({
+            "stage": "page_audit",
+            "path": "candidate_criteria",
+            "issue": "invalid_structure",
+            "action": "aborted",
+        }) from None
+
+    if not raw_groups:
+        diagnostics.append({
+            "stage": "page_audit",
+            "path": "candidate_criteria",
+            "issue": "empty_declared_audit",
+            "action": "defaulted_not_proven",
+        })
+
+    groups_by_index: dict[int, Mapping] = {}
+    for group_position, group in enumerate(raw_groups):
+        prefix = f"candidate_criteria[{group_position}]"
+        if not isinstance(group, Mapping):
+            diagnostics.append({
+                "stage": "page_audit", "path": prefix,
+                "issue": "invalid_item", "action": "discarded",
+            })
+            continue
+        candidate_index = group.get("candidate_index")
+        if (
+            isinstance(candidate_index, bool)
+            or not isinstance(candidate_index, int)
+            or candidate_index < 0
+            or candidate_index >= len(declared_candidates)
+            or candidate_index in groups_by_index
+            or not isinstance(group.get("criteria"), list)
+        ):
+            diagnostics.append({
+                "stage": "page_audit", "path": prefix,
+                "issue": "invalid_item", "action": "discarded",
+            })
+            continue
+        groups_by_index[candidate_index] = group
+
+    expected = {
+        item.id: item for item in criteres_notables(requirements).criteria
+    }
+    candidates: list[CandidateAudit] = []
+    for candidate_index, lead in enumerate(declared_candidates):
+        group = groups_by_index.get(candidate_index)
+        criteria_by_id: dict[str, CriterionAudit] = {}
+        raw_criteria = group.get("criteria", []) if group is not None else []
+        if group is None and raw_groups:
+            diagnostics.append({
+                "stage": "page_audit",
+                "path": f"candidate_criteria[{candidate_index}]",
+                "issue": "empty_declared_audit",
+                "action": "defaulted_not_proven",
+            })
+        elif group is not None and not raw_criteria:
+            diagnostics.append({
+                "stage": "page_audit",
+                "path": f"candidate_criteria[{candidate_index}].criteria",
+                "issue": "empty_declared_audit",
+                "action": "defaulted_not_proven",
+            })
+        for criterion_index, raw_criterion in enumerate(raw_criteria):
+            prefix = (
+                f"candidate_criteria[{candidate_index}].criteria[{criterion_index}]"
+            )
+            if isinstance(raw_criterion, BaseModel):
+                raw_criterion = raw_criterion.model_dump()
+            if not isinstance(raw_criterion, Mapping):
+                diagnostics.append({
+                    "stage": "page_audit", "path": prefix,
+                    "issue": "invalid_item", "action": "discarded",
+                })
+                continue
+            requirement_id = raw_criterion.get("requirement_id")
+            if requirement_id not in expected or requirement_id in criteria_by_id:
+                diagnostics.append({
+                    "stage": "page_audit", "path": prefix,
+                    "issue": "invalid_item", "action": "discarded",
+                })
+                continue
+            requirement = expected[requirement_id]
+            supplied_value = raw_criterion.get("requested_value")
+            if supplied_value not in (None, requirement.requested_value):
+                diagnostics.append({
+                    "stage": "page_audit",
+                    "path": f"{prefix}.requested_value",
+                    "issue": "invalid_item",
+                    "action": "discarded",
+                })
+            try:
+                criterion = CriterionAudit.model_validate(
+                    _recuperer_preuves_mal_formees(
+                        {
+                            **dict(raw_criterion),
+                            "requested_value": requirement.requested_value,
+                        },
+                        page_url=page_url,
+                        prefix=prefix,
+                        diagnostics=diagnostics,
+                    )
+                )
+            except ValidationError as error:
+                _append_item_diagnostics(
+                    error, prefix=prefix, diagnostics=diagnostics,
+                )
+                continue
+            criteria_by_id[requirement_id] = criterion
+
+        criteria = [
+            criteria_by_id.get(requirement.id) or CriterionAudit(
+                requirement_id=requirement.id,
+                requested_value=requirement.requested_value,
+                status="not_proven",
+            )
+            for requirement in expected.values()
+        ]
+        candidates.append(CandidateAudit(
+            brand=lead.brand,
+            reference=lead.reference,
+            criteria=criteria,
+        ))
+    return PageAudit(page_url=page_url, candidates=candidates)
+
+
 def _page_audit_structure_diagnostic(error: ValidationError) -> dict[str, str]:
     """Réduit une erreur Pydantic à son emplacement, jamais à sa valeur."""
     details = error.errors(include_url=False, include_context=False)
@@ -533,7 +680,18 @@ def analyser_page(
 ) -> PageAnalysis:
     """Fait analyser une page par ScrapeGraphAI, sans lui déléguer la preuve."""
     validation_diagnostics: list[dict[str, str]] = []
-    if mode == "discovery":
+    declared_candidates = (
+        confirmed_candidate_leads(
+            authorized_candidates,
+            page_url=page.url,
+            title=page.title,
+            content=page.content,
+            document=document,
+        )
+        if mode in {"discovery", "targeted"}
+        else ()
+    )
+    if mode == "discovery" and not declared_candidates:
         discovery_document = document or build_discovery_document(
             url=page.url,
             title=page.title,
@@ -618,53 +776,78 @@ def analyser_page(
             requirements,
             target_brand,
             page.url,
-            authorized_candidates=authorized_candidates,
+            authorized_candidates=declared_candidates,
         )
-        if mode == "targeted"
+        if declared_candidates
         else construire_mission_audit(requirements, target_brand, page.url)
+    )
+    schema = (
+        DeclaredCandidateCriteriaEnvelope
+        if declared_candidates
+        else PageAuditEnvelope
     )
     try:
         raw, graph = _run_page_graph_with_retry(
             prompt=prompt,
             source=source,
             graph_config=graph_config,
-            schema=PageAuditEnvelope,
+            schema=schema,
             graph_factory=graph_factory,
             diagnostics=validation_diagnostics,
         )
-        audit = _validate_page_audit_items(
-            raw,
-            page_url=page.url,
-            diagnostics=validation_diagnostics,
+        audit = (
+            _validate_declared_candidate_criteria(
+                raw,
+                page_url=page.url,
+                requirements=requirements,
+                declared_candidates=declared_candidates,
+                diagnostics=validation_diagnostics,
+            )
+            if declared_candidates
+            else _validate_page_audit_items(
+                raw,
+                page_url=page.url,
+                diagnostics=validation_diagnostics,
+            )
         )
     except PageAuditExtractionError as error:
+        if declared_candidates:
+            validation_diagnostics.extend(error.safe_diagnostics)
+            audit = _validate_declared_candidate_criteria(
+                {"candidate_criteria": []},
+                page_url=page.url,
+                requirements=requirements,
+                declared_candidates=declared_candidates,
+                diagnostics=validation_diagnostics,
+            )
+        else:
         # Un JSON totalement cassé garde le chemin historique : l'appelant
         # isole la page et expose le diagnostic de reprise. Une structure JSON
         # valide mais globalement invalide reste, elle, représentable par un
         # audit vide et son chemin sûr dans le rapport.
-        if (
-            not page.content.strip()
-            or error.safe_diagnostics[0]["issue"] == "json_parse_error"
-        ):
-            raise
-        return PageAnalysis(
-            page_url=page.url,
-            content=page.content,
-            audit=PageAudit(page_url=page.url),
-            mode=mode,
-            validation_diagnostics=error.safe_diagnostics,
-        )
+            if (
+                not page.content.strip()
+                or error.safe_diagnostics[0]["issue"] == "json_parse_error"
+            ):
+                raise
+            return PageAnalysis(
+                page_url=page.url,
+                content=page.content,
+                audit=PageAudit(page_url=page.url),
+                mode=mode,
+                validation_diagnostics=error.safe_diagnostics,
+            )
     content = page.content or _contenu_recupere(graph)
     if not content.strip():
         raise PageBloquee("page vide après les récupérations Scrapling et ScrapeGraphAI")
-    if mode == "targeted":
+    if declared_candidates:
         audit = filter_page_audit(
             audit,
             page_url=page.url,
             title=page.title,
             content=content,
             document=document,
-            authorized_candidates=authorized_candidates,
+            authorized_candidates=declared_candidates,
             targeted=True,
         )
     return PageAnalysis(

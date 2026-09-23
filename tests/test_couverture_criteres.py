@@ -91,6 +91,110 @@ def test_compteur_ne_declenche_rien_quand_les_specs_sont_deja_couvertes():
     assert bilan.orphans == ()
 
 
+def test_compteur_signale_les_discriminants_categoriels_absents():
+    """Une fiche ne peut pas devenir équivalente sur ses seules dimensions."""
+    from couverture_criteres import evaluer_couverture
+
+    fiche = (
+        "Bore diameter: 25 mm\n"
+        "Outside diameter: 52 mm\n"
+        "Width: 15 mm\n"
+        "Radial internal clearance: CN\n"
+        "Sealing: Seal on both sides\n"
+        "Sealing type: Contact\n"
+        "Lubricant: Grease"
+    )
+    requirements = RequirementSet(
+        product="Deep groove ball bearing SRC-205",
+        criteria=[
+            Requirement(id="bore", label="Bore diameter", requested_value="25 mm"),
+            Requirement(id="outside", label="Outside diameter", requested_value="52 mm"),
+            Requirement(id="width", label="Width", requested_value="15 mm"),
+        ],
+    )
+
+    bilan = evaluer_couverture(fiche, requirements)
+
+    assert [(item.label, item.value, item.reason) for item in bilan.orphans] == [
+        ("Radial internal clearance", "CN", "missing_categorical_spec"),
+        ("Sealing", "Seal on both sides", "missing_categorical_spec"),
+    ]
+    assert bilan.detected_specs == 5
+    assert bilan.covered_specs == 3
+
+
+def test_compteur_signale_un_joint_des_deux_cotes_ecrit_dans_la_description():
+    """Un état d'étanchéité littéral ne peut pas disparaître faute de libellé."""
+    from couverture_criteres import evaluer_couverture
+
+    fiche = (
+        "Description: Deep groove ball bearing with seals on both sides\n"
+        "Bore diameter: 25 mm\n"
+        "Outside diameter: 52 mm\n"
+        "Width: 15 mm"
+    )
+    requirements = RequirementSet(
+        product="Deep groove ball bearing 6205-2RSH",
+        criteria=[
+            Requirement(id="bore", label="Bore diameter", requested_value="25 mm"),
+            Requirement(id="outside", label="Outside diameter", requested_value="52 mm"),
+            Requirement(id="width", label="Width", requested_value="15 mm"),
+        ],
+    )
+
+    bilan = evaluer_couverture(fiche, requirements)
+
+    assert [(item.label, item.value, item.reason) for item in bilan.orphans] == [
+        ("Sealing", "with seals on both sides", "missing_categorical_spec"),
+    ]
+
+
+def test_planner_recovers_a_literal_sealing_constraint_omitted_initially():
+    """La seconde passe rend ce discriminant auditable, elle ne le déduit pas."""
+    fiche = (
+        "Description: Deep groove ball bearing with seals on both sides\n"
+        "Bore diameter: 25 mm\nOutside diameter: 52 mm\nWidth: 15 mm"
+    )
+    initial = RequirementSet(
+        product="Deep groove ball bearing 6205-2RSH",
+        criteria=[
+            Requirement(id="bore", label="Bore diameter", requested_value="25 mm"),
+            Requirement(id="outside", label="Outside diameter", requested_value="52 mm"),
+            Requirement(id="width", label="Width", requested_value="15 mm"),
+        ],
+    )
+
+    class Graph:
+        def run(self):
+            return initial.model_dump()
+
+    def supplement_extractor(_requirements, coverage, *_):
+        assert [(item.label, item.value) for item in coverage.orphans] == [
+            ("Sealing", "with seals on both sides"),
+        ]
+        return RequirementSupplement(criteria=[RequirementAddition(
+            id="sealing",
+            label="Sealing",
+            requested_value="with seals on both sides",
+            evidence_excerpt="Deep groove ball bearing with seals on both sides",
+        )])
+
+    planner = Planner(
+        B2Config(api_key="test"),
+        graph_factory=lambda **_: Graph(),
+        supplement_extractor=supplement_extractor,
+    )
+
+    result = planner.extract_requirements(fiche)
+
+    assert [(item.id, item.requested_value) for item in result.criteria] == [
+        ("bore", "25 mm"),
+        ("outside", "52 mm"),
+        ("width", "15 mm"),
+        ("sealing", "with seals on both sides"),
+    ]
+
+
 def test_compteur_compare_des_specs_entieres_et_ne_confond_pas_9a_avec_19a():
     from couverture_criteres import evaluer_couverture
 

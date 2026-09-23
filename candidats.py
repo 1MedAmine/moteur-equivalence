@@ -65,6 +65,24 @@ class PageAuditEnvelope(BaseModel):
     )
 
 
+_DECLARED_CANDIDATE_CRITERIA_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidate_index": {"type": "integer"},
+        "criteria": _PAGE_AUDIT_CANDIDATE_OUTPUT_SCHEMA["properties"]["criteria"],
+    },
+}
+
+
+class DeclaredCandidateCriteriaEnvelope(BaseModel):
+    """Jugements techniques pour des identités déjà déclarées par le code."""
+
+    candidate_criteria: list[object] = Field(
+        default_factory=list,
+        json_schema_extra={"items": _DECLARED_CANDIDATE_CRITERIA_OUTPUT_SCHEMA},
+    )
+
+
 class DiscoveryEnvelope(BaseModel):
     leads: list[object] = Field(default_factory=list)
     audit: PageAuditEnvelope | None = None
@@ -88,6 +106,7 @@ class CandidateLead:
     rank: int = 0
     low_confidence: bool = False
     discovery_relevance: int = 0
+    identity_strength: int = 0
 
     @property
     def key(self) -> tuple[str, str]:
@@ -165,6 +184,50 @@ def reference_is_present(reference: str, source: str) -> bool:
     return identity_present(reference, source)
 
 
+def confirmed_candidate_leads(
+    leads: Sequence[CandidateLead],
+    *,
+    page_url: str,
+    title: str,
+    content: str,
+    document: DiscoveryDocument | None = None,
+) -> tuple[CandidateLead, ...]:
+    """Confirme marque et référence sur la page avant tout audit technique."""
+    metadata = [title, content]
+    if document is not None:
+        metadata.extend((document.title, *document.snippets))
+    confirmed: list[CandidateLead] = []
+    for lead in leads:
+        segments = _segments(lead.reference)
+        if not segments:
+            continue
+        separator = r"[\W_]*"
+        reference_pattern = re.compile(
+            r"(?<![^\W_])"
+            + separator.join(re.escape(part) for part in segments)
+            + r"(?![^\W_])",
+            re.UNICODE,
+        )
+        attributed = False
+        for raw_source in metadata:
+            source = _normalise(raw_source)
+            for match in reference_pattern.finditer(source):
+                segment = _fallback_attribution_segment(source, *match.span())
+                if (
+                    brand_is_present(lead.brand, segment)
+                    and _brand_reference_attributed(
+                        lead.brand, lead.reference, segment
+                    )
+                ):
+                    attributed = True
+                    break
+            if attributed:
+                break
+        if attributed:
+            confirmed.append(lead)
+    return tuple(confirmed)
+
+
 def query_contains_identity(query: str, lead: CandidateLead) -> bool:
     return brand_is_present(lead.brand, query) and reference_is_present(
         lead.reference, query
@@ -192,6 +255,31 @@ def brand_is_literal(
     )
 
 
+_RECOMMENDATION_SECTION = re.compile(
+    r"(?im)^\s*(?:"
+    r"customers?\s+also\s+(?:bought|viewed)|"
+    r"you\s+may\s+also\s+like|"
+    r"related\s+products?|recommended\s+products?|"
+    r"les\s+clients\s+ont\s+aussi\s+achet[eé]|"
+    r"produits?\s+similaires?|vous\s+aimerez\s+aussi|"
+    r"(?:\d+\s+)?autres?\s+produits?\s+s[eé]lectionn[eé]s?\s+pour\s+vous|"
+    r"alternatives?\s+comparables?|produits?\s+de\s+substitution|"
+    r"equivalents?\s+(?:produits?|compatibles?)"
+    r")\s*$"
+)
+
+
+def primary_product_content(content: str) -> str:
+    """Isole l'identité du produit principal avant les rayons de recommandation.
+
+    Le corps complet reste disponible à l'audit technique. Cette vue ne sert
+    qu'à déclarer ou confirmer l'identité : une carte « aussi acheté » ne doit
+    pas devenir un candidat ni confirmer la fiche de son voisin.
+    """
+    match = _RECOMMENDATION_SECTION.search(content or "")
+    return (content or "")[:match.start()] if match else (content or "")
+
+
 def _document_fields(
     document: DiscoveryDocument,
     *,
@@ -199,14 +287,19 @@ def _document_fields(
 ) -> tuple[tuple[FieldName, str], ...]:
     if bounded:
         if document.bounded_fields:
-            return document.bounded_fields
+            return tuple(
+                (field, primary_product_content(value) if field == "content" else value)
+                for field, value in document.bounded_fields
+            )
         legacy_limit = DiscoveryLimits().total_chars
-        return (("content", document.prompt_source[:legacy_limit]),)
+        return (("content", primary_product_content(
+            document.prompt_source[:legacy_limit]
+        )),)
     return (
         ("title", document.title),
         *(("snippet", snippet) for snippet in document.snippets),
         ("url", unquote(document.url)),
-        ("content", document.content),
+        ("content", primary_product_content(document.content)),
     )
 
 
@@ -261,8 +354,13 @@ _GENERIC_BRAND_WORDS = frozenset({
     "groupe", "inc", "industrial", "industrie", "ltd", "sa", "sas",
 })
 _ORIGIN_REFERENCE = re.compile(
-    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)"
-    r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*(?![A-Za-z0-9])"
+    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9_/-]*[A-Za-z])(?=[A-Za-z0-9_/-]*\d)"
+    r"[A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+)*(?![A-Za-z0-9])"
+)
+_ORIGIN_CRITERION_HINT = re.compile(
+    r"reference|référence|ref\b|model|modèle|part\s*number|sku|"
+    r"origin|origine|source|identity|identité",
+    re.IGNORECASE,
 )
 
 
@@ -315,9 +413,19 @@ def origin_identities(requirements: RequirementSet) -> OriginIdentities:
             if key:
                 references.add(key)
 
+    # Une valeur technique compacte (par exemple une capacité ou une classe)
+    # peut avoir la même forme alphanumérique qu'une référence. Si elle est
+    # déjà portée par un critère non identitaire, elle doit rester auditable et
+    # ne peut pas devenir une identité source par sa seule présence dans le
+    # libellé produit.
+    technical_values = {
+        _canonical(item.requested_value)
+        for item in requirements.criteria
+        if not _ORIGIN_CRITERION_HINT.search(f"{item.id} {item.label}")
+    }
     for match in _ORIGIN_REFERENCE.finditer(unquote(requirements.product)):
         key = _canonical(match.group(0))
-        if key:
+        if key and key not in technical_values:
             references.add(key)
     return OriginIdentities(tuple(brands), frozenset(ranges), frozenset(references))
 
@@ -396,6 +504,119 @@ def est_grandeur_physique(reference: str) -> bool:
     return bool(correspondance) and correspondance.group(1).casefold() in _UNITES
 
 
+_DIMENSION_SIGNATURE = re.compile(
+    r"^\s*\d+(?:[.,]\d+)?\s*(?:mm\s*)?[x×]"
+    r"\s*\d+(?:[.,]\d+)?\s*(?:mm)?"
+    r"(?:\s*[x×]\s*\d+(?:[.,]\d+)?\s*(?:mm)?)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def reference_is_dimension_signature(reference: str) -> bool:
+    """Refuse une cote ``d x D x B`` présentée comme référence article."""
+    return _DIMENSION_SIGNATURE.fullmatch(str(reference or "")) is not None
+
+
+def _without_redundant_brand_suffix(
+    proposal: CandidateProposal,
+) -> CandidateProposal:
+    """Retire le nom de marque ajouté à la fin d'un code distributeur.
+
+    `ALT-205-MAKER` reste une observation littérale de `ALT-205` : seule la
+    répétition terminale de la marque est retirée, avec un séparateur exigé.
+    """
+    brand_parts = _segments(proposal.brand)
+    if not brand_parts:
+        return proposal
+    suffix = r"[\W_]+" + r"[\W_]*".join(
+        re.escape(part) for part in brand_parts
+    ) + r"\s*$"
+    reference = re.sub(suffix, "", proposal.reference, flags=re.IGNORECASE).rstrip()
+    plausible, _ = _plausible_fallback_reference(reference)
+    if not reference or reference == proposal.reference or not plausible:
+        return proposal
+    return proposal.model_copy(update={"reference": reference})
+
+
+_EXPLICIT_REFERENCE_LABEL = r"(?:reference|r[eé]f[eé]rence|ref|model|mod[eè]le|sku|mpn)"
+_EXPLICIT_BRAND_LABEL = r"(?:de\s+la\s+marque|brand|manufacturer|fabricant|marque)"
+
+
+def _identity_pattern(value: str) -> str:
+    segments = _segments(value)
+    if not segments:
+        return r"(?!)"
+    return r"(?<![^\W_])" + r"[\W_]*".join(
+        re.escape(segment) for segment in segments
+    ) + r"(?![^\W_])"
+
+
+def _brand_reference_attributed(
+    brand: str,
+    reference: str,
+    source: str,
+    requirements: RequirementSet | None = None,
+) -> bool:
+    """Exige une attribution locale, ou des libellés d'identité explicites."""
+    normalized = _normalise(source)
+    brand_pattern = _identity_pattern(brand)
+    reference_pattern = _identity_pattern(reference)
+    explicit_patterns = (
+        rf"{_EXPLICIT_REFERENCE_LABEL}\s*[:#=-]?\s*{reference_pattern}"
+        rf".{{0,100}}?{_EXPLICIT_BRAND_LABEL}\s*[:#=-]?\s*{brand_pattern}",
+        rf"{_EXPLICIT_BRAND_LABEL}\s*[:#=-]?\s*{brand_pattern}"
+        rf".{{0,100}}?{_EXPLICIT_REFERENCE_LABEL}\s*[:#=-]?\s*{reference_pattern}",
+    )
+    if any(re.search(pattern, normalized, re.DOTALL) for pattern in explicit_patterns):
+        return True
+
+    connector = re.compile(
+        r"^(?:[ \t|:,/\-–—()]*|[ \t|:,/\-–—()]*(?:(?:by|par|de|from|maker|brand|marque|"
+        r"manufacturer|fabricant|model|mod[eè]le|reference|r[eé]f[eé]rence|"
+        r"ref|product|produit)[ \t|:,/\-–—()]*){1,4})$",
+        re.IGNORECASE,
+    )
+    brand_matches = tuple(re.finditer(brand_pattern, normalized, re.UNICODE))
+    reference_matches = tuple(re.finditer(reference_pattern, normalized, re.UNICODE))
+    for brand_match in brand_matches:
+        for reference_match in reference_matches:
+            if brand_match.end() <= reference_match.start():
+                between = normalized[brand_match.end():reference_match.start()]
+            elif reference_match.end() <= brand_match.start():
+                between = normalized[reference_match.end():brand_match.start()]
+            else:
+                return True
+            if len(between) <= 80 and connector.fullmatch(between):
+                return True
+            if (
+                requirements is not None
+                and len(between) <= 80
+                and not re.search(r"[\n\r;.!?]", between)
+                and _fallback_product_vocabulary(between, requirements)
+            ):
+                return True
+    return False
+
+
+def _document_attributes_identity(
+    proposal: CandidateProposal,
+    document: DiscoveryDocument,
+    requirements: RequirementSet,
+    *,
+    bounded: bool,
+) -> bool:
+    fields = _document_fields(document, bounded=bounded)
+    if any(
+        field != "url"
+        and _brand_reference_attributed(
+            proposal.brand, proposal.reference, source, requirements
+        )
+        for field, source in fields
+    ):
+        return True
+    return False
+
+
 def reference_est_purement_numerique(reference: str) -> bool:
     """Vrai si la valeur ne porte aucune lettre.
 
@@ -406,6 +627,93 @@ def reference_est_purement_numerique(reference: str) -> bool:
     """
     canonique = _canonical(reference)
     return bool(canonique) and canonique.isdigit()
+
+
+def _reference_is_embedded_fragment(
+    reference: str,
+    document: DiscoveryDocument,
+    *,
+    bounded: bool,
+) -> bool:
+    """Refuse un suffixe court qui n'est jamais publié comme référence autonome."""
+    if len(_canonical(reference)) >= _MIN_NESTED_REFERENCE_LENGTH:
+        return False
+    seen = False
+    for field, raw_source in _document_fields(document, bounded=bounded):
+        if not reference_is_present(reference, raw_source):
+            continue
+        seen = True
+        if not reference_is_only_embedded(reference, raw_source, field=field):
+            return False
+    return seen
+
+
+def reference_is_only_embedded(
+    reference: str,
+    source: str,
+    *,
+    field: FieldName = "content",
+) -> bool:
+    """Vrai si chaque occurrence courte appartient à une désignation plus longue."""
+    if len(_canonical(reference)) >= _MIN_NESTED_REFERENCE_LENGTH:
+        return False
+    normalized = _normalise(source)
+    pattern = re.compile(_identity_pattern(reference), re.IGNORECASE | re.UNICODE)
+    seen = False
+    for match in pattern.finditer(normalized):
+        seen = True
+        separators = r"\s_\-–—" if field == "url" else r"\s/_\-–—"
+        left = re.search(
+            rf"([a-z0-9]+)[{separators}]*$", normalized[:match.start()]
+        )
+        right = re.match(
+            rf"[{separators}]*([a-z0-9]+)", normalized[match.end():]
+        )
+        neighbours = [
+            neighbour.group(1)
+            for neighbour in (left, right)
+            if neighbour is not None
+        ]
+        embedded = any(
+            len(_canonical(neighbour)) >= 2
+            and any(character.isdigit() for character in neighbour)
+            for neighbour in neighbours
+        )
+        if not embedded:
+            return False
+    return seen
+
+
+def _reference_is_site_identity(
+    reference: str,
+    document: DiscoveryDocument,
+) -> bool:
+    """Écarte le nom de site lorsqu'une vraie référence produit est explicite."""
+    reference_key = _canonical(reference)
+    hostname = (urlsplit(document.url).hostname or "").casefold()
+    hostname_keys = {
+        _canonical(label) for label in hostname.split(".") if _canonical(label)
+    }
+    if not reference_key or reference_key not in hostname_keys:
+        return False
+
+    explicit_references = [
+        value
+        for _, label, value in _discovery_metadata_fields(document)
+        if _EXPLICIT_REFERENCE_METADATA.search(label)
+    ]
+    if any(
+        _canonical(value) and _canonical(value) != reference_key
+        for value in explicit_references
+    ):
+        return True
+
+    path = unquote(urlsplit(document.url).path)
+    for token in re.findall(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+", path):
+        plausible, strong = _plausible_fallback_reference(token)
+        if plausible and strong and _canonical(token) != reference_key:
+            return True
+    return False
 
 
 def _ambiguous_reference(reference: str) -> bool:
@@ -424,12 +732,24 @@ def rejection_reason(
     bounded: bool = False,
 ) -> str | None:
     """Applique l'ordre de diagnostic stable du contrat de découverte."""
+    if _canonical(proposal.brand) == _canonical(proposal.reference):
+        return "brand_is_reference"
+    if _brand_is_product_noun(proposal.brand):
+        return "brand_is_product_noun"
     if _is_origin_identity(proposal, requirements):
         return "origin_identity"
     if target_brand and target_brand.strip() and not _brands_match(proposal.brand, target_brand):
         return "target_brand_mismatch"
+    if reference_is_dimension_signature(proposal.reference):
+        return "reference_is_dimension_signature"
     if not reference_is_literal(proposal.reference, document, bounded=bounded):
         return "reference_not_literal"
+    if _reference_is_embedded_fragment(
+        proposal.reference, document, bounded=bounded,
+    ):
+        return "reference_embedded_fragment"
+    if _reference_is_site_identity(proposal.reference, document):
+        return "reference_is_site_identity"
     target_graph_proposal = bool(target_brand and target_brand.strip() and _brands_match(proposal.brand, target_brand))
     if (
         not brand_is_literal(proposal.brand, document, bounded=bounded)
@@ -445,6 +765,18 @@ def rejection_reason(
     # grandeur ne designe aucun produit, qu'elle figure ou non au besoin.
     if est_grandeur_physique(proposal.reference):
         return "reference_is_a_quantity"
+    if (
+        not (target_brand and target_brand.strip())
+        and _explicit_metadata_brand_conflict(proposal.brand, document)
+    ):
+        return "brand_conflicts_explicit_metadata"
+    if (
+        not (target_brand and target_brand.strip())
+        and not _document_attributes_identity(
+            proposal, document, requirements, bounded=bounded
+        )
+    ):
+        return "brand_reference_not_attributed"
     return None
 
 
@@ -509,6 +841,7 @@ def merge_lead(
     *,
     low_confidence: bool = False,
     discovery_relevance: int = 0,
+    identity_strength: int = 0,
 ) -> CandidateLead:
     key = canonical_candidate_key(proposal.brand, proposal.reference)
     if existing is None:
@@ -520,6 +853,7 @@ def merge_lead(
             occurrences=tuple(occurrences),
             low_confidence=low_confidence,
             discovery_relevance=discovery_relevance,
+            identity_strength=identity_strength,
         )
     merged = list(existing.occurrences)
     for occurrence in occurrences:
@@ -535,6 +869,7 @@ def merge_lead(
         discovery_relevance=max(
             existing.discovery_relevance, discovery_relevance,
         ),
+        identity_strength=max(existing.identity_strength, identity_strength),
     )
 
 
@@ -556,6 +891,7 @@ def _merge_nested_leads(
     *,
     low_confidence: bool,
     discovery_relevance: int,
+    identity_strength: int,
 ) -> CandidateLead:
     """Fusionne des identites emboitees et conserve la forme la plus courte."""
     proposal_key = canonical_candidate_key(proposal.brand, proposal.reference)
@@ -588,6 +924,10 @@ def _merge_nested_leads(
             discovery_relevance,
             *(lead.discovery_relevance for lead in leads),
         ),
+        identity_strength=max(
+            identity_strength,
+            *(lead.identity_strength for lead in leads),
+        ),
     )
 
 
@@ -608,6 +948,7 @@ def rank_leads(leads: Sequence[CandidateLead], target_brand: str | None) -> tupl
         best_rank = min((item.rank for item in lead.occurrences), default=10**9)
         return (
             0 if target and _brands_match(lead.brand, target) else 1,
+            -lead.identity_strength,
             -lead.discovery_relevance,
             0 if not lead.low_confidence else 1,
             -len({item.url for item in lead.occurrences}),
@@ -642,9 +983,9 @@ _FALLBACK_COMPACT_SPEC = re.compile(
     re.IGNORECASE,
 )
 _FALLBACK_PRODUCT_WORDS = frozenset({
-    "article", "catalog", "catalogue", "contactor", "contacteur",
+    "article", "bearing", "bearings", "catalog", "catalogue", "contactor", "contacteur",
     "datasheet", "disjoncteur", "item", "model", "modele", "part",
-    "product", "produit", "reference", "relais", "relay", "serie",
+    "product", "produit", "reference", "relais", "relay", "roulement", "roulements", "serie",
     "series", "switch", "type",
 })
 _FALLBACK_COMPARE_VERBS = frozenset({
@@ -678,9 +1019,14 @@ _FALLBACK_MAX_CANONICAL_LENGTH = 40
 
 _DISCOVERY_METADATA_LINE = re.compile(
     r"^\s*(title|og:title|twitter:title|meta\.(?:title|name)|"
-    r"jsonld\.(?:name|brand|manufacturer|model|sku|mpn|productid)|"
+    r"jsonld\.(?:name|brand(?:\.name)?|manufacturer(?:\.name)?|model|sku|mpn|productid)|"
     r"brand|manufacturer|fabricant|marque|model|modele|mod[eè]le|"
     r"sku|mpn|reference|r[eé]f[eé]rence)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+_DISCOVERY_METADATA_PAIR_LABEL = re.compile(
+    r"^\s*(brand|manufacturer|fabricant|marque|model|modele|mod[eè]le|"
+    r"sku|mpn|reference|r[eé]f[eé]rence)\s*:\s*$",
     re.IGNORECASE,
 )
 _EXPLICIT_REFERENCE_METADATA = re.compile(
@@ -688,13 +1034,30 @@ _EXPLICIT_REFERENCE_METADATA = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_BRAND_METADATA = re.compile(
-    r"(?:brand|manufacturer|fabricant|marque)$",
+    r"(?:brand(?:\.name)?|manufacturer(?:\.name)?|fabricant|marque)$",
     re.IGNORECASE,
 )
 _METADATA_BRAND_STOPWORDS = frozenset({
     "accueil", "ble", "catalog", "catalogue", "home", "product",
     "produit", "shop",
 })
+
+
+def _brand_is_product_noun(brand: str) -> bool:
+    """Un type d'article ou un libellé de marque absente n'est pas un fabricant."""
+    normalized = "".join(
+        character for character in unicodedata.normalize("NFKD", _canonical(brand))
+        if not unicodedata.combining(character)
+    )
+    return normalized in {
+        *(_canonical(word) for word in _FALLBACK_PRODUCT_WORDS),
+        *(_canonical(word) for word in _METADATA_BRAND_STOPWORDS),
+        "generic", "generique",
+    }
+_INLINE_BRAND_VALUE = re.compile(
+    rf"{_EXPLICIT_BRAND_LABEL}\s*[:#=-]?\s*([^,;|.\n]{{1,60}})",
+    re.IGNORECASE,
+)
 
 
 def _discovery_metadata_fields(
@@ -713,17 +1076,60 @@ def _discovery_metadata_fields(
         value for field, value in _document_fields(document, bounded=True)
         if field == "content"
     ), "")
-    for line in bounded_content.splitlines():
+    lines = bounded_content.splitlines()
+    for index, line in enumerate(lines):
         match = _DISCOVERY_METADATA_LINE.match(line)
         if match:
             fields.append(("content", match.group(1).casefold(), match.group(2).strip()))
+            continue
+        pair_label = _DISCOVERY_METADATA_PAIR_LABEL.match(line)
+        if pair_label and index + 1 < len(lines):
+            value = lines[index + 1].strip()
+            if value and len(value) <= 80 and ":" not in value:
+                fields.append(("content", pair_label.group(1).casefold(), value))
     return tuple(fields)
+
+
+def _explicit_metadata_brand_conflict(
+    brand: str,
+    document: DiscoveryDocument,
+) -> bool:
+    explicit = [
+        value for _, label, value in _discovery_metadata_fields(document)
+        if _EXPLICIT_BRAND_METADATA.search(label)
+    ]
+    return bool(explicit) and not any(_brands_match(brand, value) for value in explicit)
+
+
+def _identity_strength(
+    proposal: CandidateProposal,
+    document: DiscoveryDocument,
+) -> int:
+    """Priorité de piste, sans produire de preuve technique."""
+    fields = _discovery_metadata_fields(document)
+    if not any(
+        _EXPLICIT_BRAND_METADATA.search(label) and _brands_match(proposal.brand, value)
+        for _, label, value in fields
+    ):
+        return 0
+    reference_key = _canonical(proposal.reference)
+    brand_key = _canonical(proposal.brand)
+    for _, label, value in fields:
+        if not _EXPLICIT_REFERENCE_METADATA.search(label):
+            continue
+        value_key = _canonical(value)
+        if value_key == reference_key or value_key == reference_key + brand_key:
+            return 3 if re.search(r"(?:model|mod[eè]le|reference|r[eé]f[eé]rence)$", label) else 2
+    if reference_is_present(proposal.reference, document.title):
+        return 1
+    return 0
 
 
 def _metadata_brand_candidates(
     document: DiscoveryDocument,
     metadata_fields: Sequence[tuple[FieldName, str, str]],
     target_brand: str | None,
+    requirements: RequirementSet,
 ) -> tuple[str, ...]:
     metadata_text = "\n".join(value for _, _, value in metadata_fields)
     if target_brand and target_brand.strip():
@@ -733,7 +1139,19 @@ def _metadata_brand_candidates(
     hostname = (urlsplit(document.url).hostname or "").casefold()
     canonical_hostname = _canonical(hostname)
     candidates: list[str] = []
-    for _, label, value in metadata_fields:
+    explicit_candidates: list[str] = []
+    bounded_content = next((
+        value for field, value in _document_fields(document, bounded=True)
+        if field == "content"
+    ), "")
+    inline_values = [
+        match.group(1).strip()
+        for match in _INLINE_BRAND_VALUE.finditer(bounded_content)
+    ]
+    for _, label, value in (
+        *metadata_fields,
+        *(("content", "inline_brand", value) for value in inline_values),
+    ):
         fragments = [value]
         if label in {"title", "og:title", "twitter:title", "meta.title"}:
             fragments.extend(
@@ -752,13 +1170,71 @@ def _metadata_brand_candidates(
                 or canonical in _METADATA_BRAND_STOPWORDS
             ):
                 continue
-            explicit = bool(_EXPLICIT_BRAND_METADATA.search(label))
+            explicit = bool(
+                _EXPLICIT_BRAND_METADATA.search(label) or label == "inline_brand"
+            )
             domain_confirmed = len(canonical) >= 3 and canonical in canonical_hostname
             if not explicit and not domain_confirmed:
                 continue
             if candidate not in candidates:
                 candidates.append(candidate)
-    return tuple(candidates)
+            if explicit and candidate not in explicit_candidates:
+                explicit_candidates.append(candidate)
+    inferred_candidates: list[str] = []
+    product_roots = {
+        word.rstrip("s") for word in _segments(requirements.product)
+        if len(word) >= 4
+    }
+    generic_roots = {word.rstrip("s") for word in _FALLBACK_PRODUCT_WORDS}
+    for _, label, value in metadata_fields:
+        if label not in {
+            "title", "snippet", "og:title", "twitter:title", "meta.title",
+        }:
+            continue
+        for match in _FALLBACK_IDENTIFIER.finditer(value):
+            reference = match.group(0)
+            plausible, strong = _plausible_fallback_reference(reference)
+            if (
+                not plausible
+                or est_grandeur_physique(reference)
+                # Les références compactes publiées sans séparateur sont
+                # courantes. Six caractères mixtes, immédiatement voisins
+                # d'une marque dans un titre, sont assez précis pour créer
+                # une piste — jamais une preuve de compatibilité.
+                or (not strong and len(_canonical(reference)) < 6)
+                or reference_is_dimension_signature(reference)
+            ):
+                continue
+            prefix = value[:match.start()]
+            tokens = re.findall(r"[^\W\d_]+|\d+[A-Za-z]+", prefix, re.UNICODE)
+            retained = [
+                token for token in tokens
+                if token.casefold().rstrip("s") not in product_roots | generic_roots
+                and not _FALLBACK_QUANTIFIER.fullmatch(token.casefold())
+            ]
+            candidate = " ".join(retained[-4:]).strip()
+            if candidate and not any(char.isdigit() for char in candidate):
+                if candidate not in inferred_candidates:
+                    inferred_candidates.append(candidate)
+            # Certains distributeurs écrivent d'abord la référence, puis la
+            # marque (`6205EE NTN SNR`). Deux mots suffisent ici : au-delà, on
+            # commencerait à absorber la description du produit. La validation
+            # d'attribution ci-dessous exige ensuite que ce groupe soit bien
+            # adjacent à la référence dans la même métadonnée.
+            suffix = value[match.end():]
+            suffix_tokens = re.findall(
+                r"[^\W\d_]+|\d+[A-Za-z]+", suffix, re.UNICODE
+            )
+            suffix_retained = [
+                token for token in suffix_tokens
+                if token.casefold().rstrip("s") not in product_roots | generic_roots
+                and not _FALLBACK_QUANTIFIER.fullmatch(token.casefold())
+            ]
+            candidate = " ".join(suffix_retained[:2]).strip()
+            if candidate and not any(char.isdigit() for char in candidate):
+                if candidate not in inferred_candidates:
+                    inferred_candidates.append(candidate)
+    return tuple(explicit_candidates or inferred_candidates or candidates)
 
 
 def _metadata_reference_score(
@@ -832,7 +1308,9 @@ def deterministic_metadata_proposals(
     page dans ``compatibilite.py``.
     """
     metadata_fields = _discovery_metadata_fields(document)
-    brands = _metadata_brand_candidates(document, metadata_fields, target_brand)
+    brands = _metadata_brand_candidates(
+        document, metadata_fields, target_brand, requirements
+    )
     # Avec une marque imposee, une caracteristique compacte repetee dans un
     # titre (`AC3-3P`, `1NF-24VDC`) ne doit pas prendre la place d'une vraie
     # reference. On exige alors soit un libelle d'identite explicite, soit une
@@ -841,6 +1319,7 @@ def deterministic_metadata_proposals(
     # identifier Blue TAG ou Sinwa.
     minimum_score = 3 if target_brand and target_brand.strip() else 1
     found: list[CandidateProposal] = []
+    best_brand_score_by_reference: dict[str, int] = {}
     for brand in brands:
         scored: list[tuple[int, str]] = []
         scored.extend(
@@ -848,13 +1327,42 @@ def deterministic_metadata_proposals(
             for reference in _url_reference_candidates(document, brand)
         )
         for _, label, value in metadata_fields:
+            if (
+                _EXPLICIT_REFERENCE_METADATA.search(label)
+                and 2 <= len(_segments(value)) <= 4
+                and re.fullmatch(r"[\w./\-\s]+", value, re.UNICODE)
+                and _plausible_fallback_reference(value)[0]
+            ):
+                # Un SKU explicite peut contenir plusieurs groupes séparés
+                # d'espaces ; l'extraction atomique perdrait son préfixe.
+                scored.append((5, value))
             for match in _FALLBACK_IDENTIFIER.finditer(value):
                 reference = match.group(0)
+                if reference_is_dimension_signature(reference):
+                    continue
                 score = _metadata_reference_score(
                     reference, value, label, brand, requirements,
                 )
                 if score >= minimum_score:
                     scored.append((score, reference))
+        bounded_content = next((
+            value for field, value in _document_fields(document, bounded=True)
+            if field == "content"
+        ), "")
+        for match in _FALLBACK_IDENTIFIER.finditer(bounded_content):
+            reference = match.group(0)
+            plausible, _ = _plausible_fallback_reference(reference)
+            if (
+                plausible
+                and not reference_is_dimension_signature(reference)
+                and _brand_reference_attributed(
+                    brand,
+                    reference,
+                    bounded_content,
+                    requirements if not (target_brand and target_brand.strip()) else None,
+                )
+            ):
+                scored.append((4, reference))
         if not scored:
             continue
         # Une page produit peut publier a la fois une designation commerciale
@@ -865,12 +1373,24 @@ def deterministic_metadata_proposals(
         for score, reference in scored:
             if score != best_score:
                 continue
-            proposal = CandidateProposal(brand=brand, reference=reference)
+            proposal = _without_redundant_brand_suffix(
+                CandidateProposal(brand=brand, reference=reference)
+            )
             if (
                 _is_origin_identity(proposal, requirements)
                 or _is_isolated_requirement_value(reference, requirements)
             ):
                 continue
+            reference_key = _canonical(proposal.reference)
+            previous_score = best_brand_score_by_reference.get(reference_key, -1)
+            if score < previous_score:
+                continue
+            if score > previous_score:
+                found = [
+                    item for item in found
+                    if _canonical(item.reference) != reference_key
+                ]
+                best_brand_score_by_reference[reference_key] = score
             if proposal not in found:
                 found.append(proposal)
     return tuple(found)
@@ -917,12 +1437,13 @@ def _fallback_clause_bounds(
 def _fallback_product_vocabulary(
     clause: str, requirements: RequirementSet
 ) -> bool:
-    words = set(_segments(clause))
+    words = {word.rstrip("s") for word in _segments(clause)}
     requirement_words = {
-        word for word in _segments(requirements.product)
+        word.rstrip("s") for word in _segments(requirements.product)
         if len(word) >= 4
     }
-    return bool(words & (_FALLBACK_PRODUCT_WORDS | requirement_words))
+    generic_words = {word.rstrip("s") for word in _FALLBACK_PRODUCT_WORDS}
+    return bool(words & (generic_words | requirement_words))
 
 
 def _fallback_attribution_segment(
@@ -1116,6 +1637,9 @@ def filter_page_audit(
     targeted: bool = False,
 ) -> PageAudit:
     allowed = {lead.key: lead for lead in authorized_candidates}
+    identity_document = document or build_discovery_document(
+        url=page_url, title=title, snippets=(), content=content, rank=1,
+    )
     page_identity_text = f"{title}\n{content}"
     reference_sources = [page_identity_text]
     if document is not None:
@@ -1127,6 +1651,10 @@ def filter_page_audit(
     kept: list[CandidateAudit] = []
     for candidate in audit.candidates:
         key = canonical_candidate_key(candidate.brand, candidate.reference)
+        if key[0] == key[1] or _brand_is_product_noun(candidate.brand) or _explicit_metadata_brand_conflict(
+            candidate.brand, identity_document
+        ):
+            continue
         if targeted and key not in allowed:
             continue
         lead = allowed.get(key)
@@ -1223,6 +1751,7 @@ class CandidateRegistry:
         rejected: list[RejectedCandidate] = []
 
         def consider(proposal: CandidateProposal, *, fallback: bool = False) -> None:
+            proposal = _without_redundant_brand_suffix(proposal)
             reason = rejection_reason(
                 proposal,
                 document,
@@ -1243,6 +1772,7 @@ class CandidateRegistry:
             discovery_relevance = _discovery_metadata_relevance(
                 document, requirements,
             )
+            identity_strength = _identity_strength(proposal, document)
             nested_keys = [
                 existing_key
                 for existing_key in self._leads
@@ -1257,6 +1787,7 @@ class CandidateRegistry:
                     occurrences,
                     low_confidence=low_confidence,
                     discovery_relevance=discovery_relevance,
+                    identity_strength=identity_strength,
                 )
                 accepted_keys.difference_update(nested_keys)
             else:
@@ -1266,6 +1797,7 @@ class CandidateRegistry:
                     occurrences,
                     low_confidence=low_confidence,
                     discovery_relevance=discovery_relevance,
+                    identity_strength=identity_strength,
                 )
             self._leads[lead.key] = lead
             accepted_keys.add(lead.key)

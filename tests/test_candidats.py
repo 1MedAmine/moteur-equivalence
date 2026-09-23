@@ -78,6 +78,512 @@ def test_reference_variants_merge_but_an_invented_reference_is_rejected():
     assert rejected.rejected[0].reason == "reference_not_literal"
 
 
+def test_dimension_triplet_is_not_a_product_reference():
+    """Une cote ``d x D x B`` ne doit jamais devenir une identité produit."""
+    source = requirements(
+        product="Deep groove ball bearing SRC-205",
+        bore="25 mm",
+        outside="52 mm",
+        width="15 mm",
+    )
+    document = document_with(
+        "title: Ball bearing 25x52x15\njsonld.name: Example Shop\n"
+        "Reference SRC-205 by Source Maker."
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Example Shop", reference="25x52x15")],
+        document,
+        source,
+        target_brand=None,
+        allow_deterministic_fallback=False,
+    )
+
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "reference_is_dimension_signature"
+
+
+@pytest.mark.parametrize("reference", ["25x52", "25 x 52 mm", "25×52×15"])
+def test_dimension_pair_or_triplet_is_not_a_product_reference(reference):
+    document = document_with(f"Maker {reference} bearing", url="https://shop.example/p/alt")
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Maker", reference=reference)],
+        document,
+        requirements(product="Source bearing SRC-205"),
+        target_brand=None,
+        allow_deterministic_fallback=False,
+    )
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "reference_is_dimension_signature"
+
+
+@pytest.mark.parametrize("brand", ["Roulement", "Bearing", "Générique"])
+def test_product_noun_or_placeholder_is_not_a_manufacturer_brand(brand):
+    document = build_discovery_document(
+        url="https://shop.example/products/6205-2rs",
+        title=f"{brand} 6205-2RS",
+        snippets=[],
+        content=f"{brand} 6205-2RS, 25 mm x 52 mm x 15 mm",
+        rank=1,
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand=brand, reference="6205-2RS")],
+        document,
+        requirements(product="Single row deep groove ball bearing SRC-205"),
+        target_brand=None,
+        allow_deterministic_fallback=False,
+    )
+
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "brand_is_product_noun"
+
+
+def test_product_noun_audit_cannot_reenter_after_discovery():
+    from candidats import filter_page_audit
+
+    audit = PageAudit(
+        page_url="https://shop.example/products/6205-2rs",
+        candidates=[CandidateAudit(
+            brand="Roulement",
+            reference="6205-2RS",
+            criteria=[CriterionAudit(
+                requirement_id="bore", requested_value="25 mm", status="not_proven",
+            )],
+        )],
+    )
+
+    filtered = filter_page_audit(
+        audit, page_url=audit.page_url,
+        title="Roulement 6205-2RS",
+        content="Roulement 6205-2RS; 25 mm",
+    )
+
+    assert filtered.candidates == []
+
+
+def test_standalone_model_value_beats_url_slug_in_product_metadata():
+    document = build_discovery_document(
+        url="https://seller.example/product/dpi-6205-2rs-deep-groove-ball-bearing/",
+        title="DPI 6205 2RS Deep Groove Ball Bearing",
+        snippets=[],
+        content=(
+            "title: DPI 6205 2RS Deep Groove Ball Bearing\n"
+            "jsonld.brand.name: DPI\n"
+            "jsonld.item: https://seller.example/product/dpi-6205-2rs-deep-groove-ball-bearing/\n"
+            "Manufacturer:\nDPI\nType:\nSingle Row Deep Groove Ball Bearing\n"
+            "Model:\n6205-2RS\nDimensions:\nBore Diameter d:\n25 mm\n"
+        ),
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document,
+        requirements(product="Single row deep groove ball bearing SRC-205"),
+        None,
+    )
+
+    assert [(item.brand, item.reference) for item in proposals] == [
+        ("DPI", "6205-2RS"),
+    ]
+
+
+def test_explicit_model_identity_survives_a_full_open_mode_registry():
+    registry = CandidateRegistry(DiscoveryLimits(max_active=4))
+    source = requirements(product="Single row deep groove ball bearing SRC-205")
+    for index in range(4):
+        reference = f"ALT-20{index}-EXTRA"
+        registry.ingest(
+            [CandidateProposal(brand=f"Maker{index}", reference=reference)],
+            build_discovery_document(
+                url=f"https://shop{index}.example/product/{reference}",
+                title=f"Maker{index} {reference}", snippets=[],
+                content=f"Maker{index} {reference}", rank=index + 1,
+            ),
+            source, target_brand=None, allow_deterministic_fallback=False,
+        )
+
+    page = build_discovery_document(
+        url="https://seller.example/product/dpi-6205-2rs-deep-groove-ball-bearing/",
+        title="DPI 6205 2RS Deep Groove Ball Bearing",
+        snippets=[],
+        content=(
+            "jsonld.brand.name: DPI\nManufacturer:\nDPI\n"
+            "Model:\n6205-2RS\nBore Diameter d:\n25 mm\n"
+            "Outer Diameter D:\n52 mm\nBearing Width B:\n15 mm\n"
+        ),
+        rank=9,
+    )
+    registry.ingest([], page, source, target_brand=None)
+
+    assert ("DPI", "6205-2RS") in [
+        (lead.brand, lead.reference) for lead in registry.active()
+    ]
+
+
+def test_open_mode_rejects_brand_and_reference_without_product_attribution():
+    """Deux littéraux éloignés sur une boutique ne forment pas une identité."""
+    document = document_with(
+        "Marketplace Example Shop. Product code ZX-41-7 supplied by Maker."
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Example Shop", reference="ZX-41-7")],
+        document,
+        requirements(),
+        target_brand=None,
+        allow_deterministic_fallback=False,
+    )
+
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "brand_reference_not_attributed"
+
+
+def test_explicit_reference_and_brand_sentence_yields_a_deterministic_lead():
+    """Le repli relit l'identité déclarée explicitement dans le corps produit."""
+    document = build_discovery_document(
+        url="https://catalog.example/products/6205-2rs-maker",
+        title="Roulement 6205-2RS-MAKER 25x52x15 mm",
+        snippets=[],
+        content=(
+            "Le roulement, connu sous la référence 6205-2RS-MAKER, "
+            "de la marque Example Bearings, possède un diamètre intérieur "
+            "de 25mm, un diamètre extérieur de 52mm et une largeur de 15mm."
+        ),
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document,
+        requirements(product="Deep groove ball bearing SRC-205"),
+        None,
+    )
+
+    assert [(item.brand, item.reference) for item in proposals] == [
+        ("Example Bearings", "6205-2RS-MAKER")
+    ]
+
+
+def test_deterministic_identity_ignores_products_after_recommendation_heading():
+    document = build_discovery_document(
+        url="https://catalog.example/products/alt-205-maker",
+        title="Bearing ALT-205-MAKER",
+        snippets=[],
+        content=(
+            "Reference: ALT-205-MAKER\nBrand: Maker\n"
+            "CUSTOMERS ALSO BOUGHT\n"
+            "Bearing NEIGHBOR-204-MAKER\nBrand: Maker\n"
+            "Technical data\nBore 20 mm"
+        ),
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document, requirements(product="Source bearing SRC-205"), None,
+    )
+
+    assert [(item.brand, item.reference) for item in proposals] == [
+        ("Maker", "ALT-205")
+    ]
+
+
+def test_deterministic_identity_ignores_counted_french_recommendation_heading():
+    document = build_discovery_document(
+        url="https://catalog.example/products/alt-205-maker",
+        title="Bearing ALT-205-MAKER",
+        snippets=[],
+        content=(
+            "Reference: ALT-205-MAKER\nBrand: Maker\n"
+            "4 autres produits sélectionnés pour vous\n"
+            "Ref: NEIGHBOR-204 - Other\n"
+            "Technical data\nBore 20 mm"
+        ),
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document, requirements(product="Source bearing SRC-205"), None,
+    )
+
+    assert [(item.brand, item.reference) for item in proposals] == [
+        ("Maker", "ALT-205")
+    ]
+
+
+def test_reference_fragment_inside_a_longer_designation_is_rejected():
+    document = build_discovery_document(
+        url="https://maker.example/products/2050-axc3-5k",
+        title="Maker 2050 AXC3/5K",
+        snippets=["Maker 2050 AXC3/5K product page"],
+        content="Brand: Maker\nReference: 2050 AXC3/5K",
+        rank=1,
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Maker", reference="AXC3")],
+        document,
+        requirements(),
+        target_brand="Maker",
+        allow_deterministic_fallback=False,
+    )
+
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "reference_embedded_fragment"
+
+
+def test_same_short_reference_is_accepted_when_it_is_published_standalone():
+    document = build_discovery_document(
+        url="https://maker.example/products/axc3",
+        title="Maker AXC3",
+        snippets=[],
+        content="Brand: Maker\nReference: AXC3",
+        rank=1,
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Maker", reference="AXC3")],
+        document,
+        requirements(),
+        target_brand="Maker",
+        allow_deterministic_fallback=False,
+    )
+
+    assert [item.reference for item in result.accepted] == ["AXC3"]
+
+
+def test_site_hostname_token_cannot_replace_an_explicit_product_reference():
+    document = build_discovery_document(
+        url="https://shop14.example/products/mp-205-zz",
+        title="Maker MP-205-ZZ | shop14",
+        snippets=[],
+        content=(
+            "Maker shop14\n"
+            "jsonld.mpn: MP-205-ZZ\n"
+            "jsonld.brand.name: Maker"
+        ),
+        rank=1,
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Maker", reference="shop14")],
+        document,
+        requirements(),
+        target_brand=None,
+        allow_deterministic_fallback=False,
+    )
+
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "reference_is_site_identity"
+
+
+def test_explicit_nested_brand_beats_shop_name_from_domain_metadata():
+    document = build_discovery_document(
+        url="https://example-shop.test/products/alt-205-maker",
+        title="ALT-205-MAKER | Example Shop",
+        snippets=[],
+        content=(
+            "title: ALT-205-MAKER | Example Shop\n"
+            "jsonld.name: ALT-205-MAKER\n"
+            "jsonld.mpn: ALT-205-MAKER\n"
+            "jsonld.brand.name: Maker"
+        ),
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document, requirements(product="Source bearing SRC-205"), None,
+    )
+
+    assert [(item.brand, item.reference) for item in proposals] == [
+        ("Maker", "ALT-205")
+    ]
+
+
+def test_title_can_attribute_brand_through_product_words_and_pack_quantity():
+    document = build_discovery_document(
+        url="https://example-shop.test/products/2050dducm",
+        title="Maker Bearings 2PACK 2050DDUCM 25X52X15mm | Example Shop",
+        snippets=[],
+        content=(
+            "title: Maker Bearings 2PACK 2050DDUCM 25X52X15mm | Example Shop\n"
+            "jsonld.name: Example Shop\n"
+            "Maker Bearings 2PACK 2050DDUCM 25X52X15mm Double Rubber Seal"
+        ),
+        rank=1,
+    )
+    source = requirements(product="Deep groove ball bearing SRC-205")
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Maker", reference="2050DDUCM")],
+        document,
+        source,
+        target_brand=None,
+        allow_deterministic_fallback=False,
+    )
+    proposals = candidats.deterministic_metadata_proposals(document, source, None)
+
+    assert [item.reference for item in result.accepted] == ["2050DDUCM"]
+    assert ("Maker", "2050DDUCM") in [
+        (item.brand, item.reference) for item in proposals
+    ]
+
+
+@pytest.mark.parametrize(("title", "expected"), (
+    ("NSK 6205DDU Deep Groove Ball Bearing", ("NSK", "6205DDU")),
+    ("NTN 6205LLU Ball Bearing", ("NTN", "6205LLU")),
+    ("6205EE NTN SNR sealed bearing", ("NTN SNR", "6205EE")),
+))
+def test_search_metadata_extracts_compact_reference_with_adjacent_brand(
+    title: str,
+    expected: tuple[str, str],
+):
+    document = build_discovery_document(
+        url="https://distributor.example/product-page",
+        title=title,
+        snippets=[title],
+        content="",
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document,
+        requirements(product="Deep groove ball bearing SRC-205"),
+        None,
+    )
+
+    assert expected in {
+        (item.brand, item.reference) for item in proposals
+    }
+
+
+def test_search_snippet_can_attribute_reference_before_brand():
+    document = build_discovery_document(
+        url="https://distributor.example/bearing-page",
+        title="Bearing 25x52x15 product page",
+        snippets=["Sealed bearing reference 6205EE NTN SNR technical data"],
+        content="",
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document,
+        requirements(product="Deep groove ball bearing SRC-205"),
+        None,
+    )
+
+    assert {
+        (item.brand, item.reference) for item in proposals
+    } == {("NTN SNR", "6205EE")}
+
+
+def test_explicit_structured_brand_rejects_distributor_as_candidate_brand():
+    document = build_discovery_document(
+        url="https://example-shop.test/products/alt-205-maker",
+        title="ALT-205-MAKER | Example Shop",
+        snippets=[],
+        content=(
+            "title: ALT-205-MAKER | Example Shop\n"
+            "jsonld.mpn: ALT-205-MAKER\n"
+            "jsonld.brand.name: Maker"
+        ),
+        rank=1,
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="Example Shop", reference="ALT-205-MAKER")],
+        document,
+        requirements(product="Source bearing SRC-205"),
+        target_brand=None,
+        allow_deterministic_fallback=False,
+    )
+
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "brand_conflicts_explicit_metadata"
+
+
+def test_explicit_multitoken_sku_keeps_the_product_family_in_the_candidate_reference():
+    document = build_discovery_document(
+        url="https://shop.example/products/bearing-6205-2rs-maker",
+        title="Roulement à billes 6205 2RS Maker",
+        snippets=[],
+        content=(
+            "title: Roulement à billes 6205 2RS Maker\n"
+            "jsonld.sku: 6205 2RS-MAKER\n"
+            "jsonld.brand.name: Maker\n"
+            "Roulement Maker 6205 2RS"
+        ),
+        rank=1,
+    )
+
+    proposals = candidats.deterministic_metadata_proposals(
+        document, requirements(product="Deep groove bearing SRC-205"), None
+    )
+
+    assert [(item.brand, item.reference) for item in proposals] == [
+        ("Maker", "6205 2RS"),
+    ]
+
+
+def test_page_audit_does_not_treat_a_reference_as_its_own_brand():
+    url = "https://shop.example/products/6205-2RS"
+    content = "Roulement à billes 6205-2RS, 25 mm de diamètre intérieur"
+    audit = PageAudit(page_url=url, candidates=[CandidateAudit(
+        brand="6205-2RS", reference="6205-2RS",
+        criteria=[CriterionAudit(
+            requirement_id="bore", requested_value="25 mm", status="not_proven"
+        )],
+    )])
+
+    filtered = candidats.filter_page_audit(
+        audit, page_url=url, title="Roulement 6205-2RS", content=content,
+    )
+
+    assert filtered.candidates == []
+
+
+def test_candidate_registry_does_not_keep_a_reference_as_its_own_brand():
+    document = build_discovery_document(
+        url="https://shop.example/products/6205-2RS",
+        title="Roulement 6205-2RS",
+        snippets=[],
+        content="Roulement 6205-2RS, diamètre intérieur 25 mm",
+        rank=1,
+    )
+
+    result = CandidateRegistry().ingest(
+        [CandidateProposal(brand="6205-2RS", reference="6205-2RS")],
+        document, requirements(product="Source bearing SRC-205"), None,
+        allow_deterministic_fallback=False,
+    )
+
+    assert result.accepted == ()
+    assert result.rejected[0].reason == "brand_is_reference"
+
+
+def test_page_audit_respects_an_explicit_structured_brand():
+    url = "https://shop.example/products/6205-2RS"
+    content = (
+        "jsonld.brand.name: Maker\n"
+        "jsonld.sku: 6205 2RS-MAKER\n"
+        "Maker 6205 2RS. OtherCo 6205 2RS appears in a comparison."
+    )
+    audits = [CandidateAudit(
+        brand=brand, reference="6205 2RS",
+        criteria=[CriterionAudit(
+            requirement_id="bore", requested_value="25 mm", status="not_proven"
+        )],
+    ) for brand in ("Maker", "OtherCo")]
+
+    filtered = candidats.filter_page_audit(
+        PageAudit(page_url=url, candidates=audits),
+        page_url=url, title="Roulement 6205 2RS", content=content,
+    )
+
+    assert [(item.brand, item.reference) for item in filtered.candidates] == [
+        ("Maker", "6205 2RS"),
+    ]
+
+
 def test_reference_must_be_visible_in_every_supported_document_field():
     cases = [
         ("title", "Maker ZX-41-7"),

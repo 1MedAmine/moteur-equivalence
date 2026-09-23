@@ -71,6 +71,51 @@ def test_foreign_engine_rows_are_rejected_before_next_attempt():
     assert [hit.url for hit in batch.hits] == ["https://right.example"]
 
 
+def test_irrelevant_first_engine_results_do_not_stop_rotation():
+    """Une réponse reçue mais hors sujet doit laisser sa chance au moteur suivant."""
+    transport = FakeTransport([
+        {"results": [{
+            "engine": "bing",
+            "title": "T-shirt personnalisé",
+            "url": "https://clothing.example/shirt",
+            "content": "impression photo",
+        }]},
+        {"results": [{
+            "engine": "duckduckgo",
+            "title": "Roulement rigide à billes 25 x 52 x 15 mm",
+            "url": "https://maker.example/bearing-25-52-15",
+            "content": "Fiche produit roulement 25 x 52 x 15 mm",
+        }]},
+    ])
+
+    batch = _gateway(transport).search("roulement rigide billes 25 52 15")
+
+    assert [attempt.status for attempt in batch.attempts] == ["irrelevant", "ok"]
+    assert [hit.url for hit in batch.hits] == ["https://maker.example/bearing-25-52-15"]
+
+
+def test_catalog_without_numeric_family_does_not_hide_a_product_from_next_engine():
+    transport = FakeTransport([
+        {"results": [{
+            "engine": "bing",
+            "title": "Deep groove ball bearing sealed both sides catalog",
+            "url": "https://catalog.example/bearings",
+            "content": "Ball bearing seal specifications",
+        }]},
+        {"results": [{
+            "engine": "duckduckgo",
+            "title": "6205EE Roulement à billes",
+            "url": "https://maker.example/products/6205EE",
+            "content": "",
+        }]},
+    ])
+
+    batch = _gateway(transport).search("6205 bearing sealed both sides datasheet")
+
+    assert [attempt.status for attempt in batch.attempts] == ["irrelevant", "ok"]
+    assert [hit.url for hit in batch.hits] == ["https://maker.example/products/6205EE"]
+
+
 def test_results_are_capped_at_twelve():
     """Mutation détectée : une requête ouvre plus de douze résultats."""
     payload = {"results": [{
@@ -101,6 +146,29 @@ def test_three_legitimate_empty_responses_return_empty_batch():
     assert [attempt.status for attempt in batch.attempts] == ["empty"] * 3
 
 
+def test_suspended_engine_is_reported_as_blocked_instead_of_empty():
+    transport = FakeTransport([
+        {"results": [], "unresponsive_engines": [
+            ["bing", "Suspended: too many requests"]
+        ]},
+        {"results": [], "unresponsive_engines": []},
+        {"results": [{
+            "engine": "google cse", "title": "6205EE Roulement à billes",
+            "url": "https://maker.example/products/6205EE", "content": "",
+        }]},
+    ])
+
+    batch = _gateway(transport).search("6205 bearing sealed both sides")
+
+    assert [attempt.status for attempt in batch.attempts] == [
+        "blocked", "empty", "ok"
+    ]
+    assert "too many requests" in batch.attempts[0].reason
+    assert [hit.url for hit in batch.hits] == [
+        "https://maker.example/products/6205EE"
+    ]
+
+
 @pytest.mark.parametrize("url", [
     "https://www.marche-a.example/shop/norel-uk?_nkw=norel+uk",
     "https://www.marchand-b.example/s?k=norel+contactor",
@@ -116,6 +184,16 @@ def test_product_url_with_an_innocent_q_character_is_not_a_list_page():
     assert est_page_de_liste(
         "https://maker.example/products/quality-switch"
     ) is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://market.example/cat/bearings",
+    "https://market.example/collections/sealed-bearings",
+    "https://market.example/manufacturers/bearing-6205",
+    "https://market.example/g/deep-groove-ball-bearing.html",
+])
+def test_explicit_collection_paths_do_not_consume_product_page_budget(url):
+    assert est_page_de_liste(url) is True
 
 
 def test_s_path_is_a_list_only_in_the_explicit_s_query_form():

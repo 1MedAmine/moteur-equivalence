@@ -19,6 +19,8 @@ from compatibilite import (
     EvidenceContractError,
     _brand_matches,
     cached_reaudit_downgraded_criteria,
+    criteres_notables,
+    _effective_status,
     _official_page_confirms_identity,
     _range_contains_requested,
     evaluate_candidates,
@@ -37,7 +39,63 @@ from mission import construire_mission_audit, construire_mission_criteres
 
 
 URL = "https://new.norel.example/product/ref-1"
-CONTENT = "Référence REF-1. Tension de commande 24 V DC. Trois pôles. Courant 9 A."
+CONTENT = (
+    "Référence REF-1. Tension de commande 24 V DC. Trois pôles. Courant 9 A. "
+    "Fréquence 50 Hz."
+)
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "label", "requested"),
+    (
+        ("bore_diameter", "Bore diameter", "25 mm"),
+        ("outside_diameter", "Outside diameter", "52 mm"),
+        ("width", "Width", "15 mm"),
+    ),
+)
+def test_compact_dimension_triplet_is_compared_by_named_axis(
+    requirement_id, label, requested,
+):
+    requirement = Requirement(
+        id=requirement_id,
+        label=label,
+        requested_value=requested,
+        critical=True,
+    )
+    criterion = CriterionAudit(
+        requirement_id=requirement_id,
+        requested_value=requested,
+        observed_value="25x52x15mm",
+        status="proven",
+        proofs=[SourceProof(url=URL, excerpt="25x52x15mm", type="web_secondaire")],
+    )
+
+    assert _effective_status(requirement, criterion) == "proven"
+
+#: Une valeur réelle par indice de critère placeholder (r1..r4), chacune déjà
+#: présente dans `CONTENT` : la preuve par défaut peut ainsi énoncer ce
+#: qu'elle est censée prouver, au lieu de n'en partager que la présence sur
+#: la page. `_PLACEHOLDER_PHRASES` porte le même ordre, en phrase complète,
+#: pour construire l'extrait par défaut.
+_PLACEHOLDER_VALUES = ("24 V DC", "Trois pôles", "9 A", "50 Hz")
+_PLACEHOLDER_PHRASES = (
+    "Tension de commande 24 V DC",
+    "Trois pôles",
+    "Courant 9 A",
+    "Fréquence 50 Hz",
+)
+#: Contrepartie d'un statut « incompatible » : une valeur reellement
+#: differente de `_PLACEHOLDER_VALUES`, et sa phrase — sans quoi
+#: `observed_value` egalerait `requested_value` et `_effective_status`
+#: requaliferait le critere en `proven`, ce qui n'est pas ce qu'un test
+#: d'incompatibilite verifie.
+_PLACEHOLDER_INCOMPATIBLE_VALUES = ("48 V AC", "Quatre pôles", "16 A", "60 Hz")
+_PLACEHOLDER_INCOMPATIBLE_PHRASES = (
+    "Tension de commande 48 V AC",
+    "Quatre pôles",
+    "Courant 16 A",
+    "Fréquence 60 Hz",
+)
 
 
 def _requirements(count: int = 4, critical: set[str] | None = None) -> RequirementSet:
@@ -48,7 +106,7 @@ def _requirements(count: int = 4, critical: set[str] | None = None) -> Requireme
             Requirement(
                 id=f"r{index}",
                 label=f"Critère {index}",
-                requested_value=f"valeur {index}",
+                requested_value=_PLACEHOLDER_VALUES[index - 1],
                 critical=f"r{index}" in critical,
             )
             for index in range(1, count + 1)
@@ -60,7 +118,11 @@ def _candidate(statuses: list[str], *, reference: str = "REF-1",
                brand: str = "Norel", proof: SourceProof | None = None) -> CandidateAudit:
     evidence = proof or SourceProof(
         url=URL,
-        excerpt="Tension de commande 24 V DC",
+        excerpt=". ".join(
+            _PLACEHOLDER_INCOMPATIBLE_PHRASES[index] if status == "incompatible"
+            else _PLACEHOLDER_PHRASES[index]
+            for index, status in enumerate(statuses)
+        ),
         type="web_officiel",
     )
     return CandidateAudit(
@@ -69,8 +131,11 @@ def _candidate(statuses: list[str], *, reference: str = "REF-1",
         criteria=[
             CriterionAudit(
                 requirement_id=f"r{index}",
-                requested_value=f"valeur {index}",
-                observed_value=f"valeur {index}",
+                requested_value=_PLACEHOLDER_VALUES[index - 1],
+                observed_value=(
+                    _PLACEHOLDER_INCOMPATIBLE_VALUES[index - 1] if status == "incompatible"
+                    else _PLACEHOLDER_VALUES[index - 1]
+                ),
                 status=status,
                 proofs=[evidence] if status != "not_proven" else [],
             )
@@ -101,11 +166,20 @@ def test_score_is_computed_from_immutable_criteria():
     assert not evaluation.complete
 
 
+#: Page assortie a l'extrait que `_candidate` construit pour
+#: `["proven", "proven", "proven", "incompatible"]` : les trois premieres
+#: valeurs standard, la quatrieme dans sa variante incompatible.
+_CONTENT_WITH_R4_INCOMPATIBLE = "Référence REF-1. " + ". ".join(
+    _PLACEHOLDER_PHRASES[:3] + _PLACEHOLDER_INCOMPATIBLE_PHRASES[3:4]
+)
+
+
 def test_critical_incompatibility_blocks_even_at_threshold():
     """Mutation détectée : un calibre/tension incompatible passe grâce au score."""
     evaluation = _evaluate(
         _requirements(4, critical={"r4"}),
         _candidate(["proven", "proven", "proven", "incompatible"]),
+        pages={URL: _CONTENT_WITH_R4_INCOMPATIBLE},
     )
 
     assert evaluation.summary.score == 75
@@ -347,29 +421,30 @@ def test_identity_led_sentence_with_technical_context_remains_admissible():
     source_type=st.sampled_from(["web_officiel", "web_secondaire"]),
     threshold=st.integers(min_value=1, max_value=100),
 )
-def test_verified_incompatibility_is_never_eligible_for_any_source_or_threshold(
+def test_verified_critical_incompatibility_is_never_eligible_for_any_threshold(
     source_type,
     threshold,
 ):
-    """PBT-03 : le score et la provenance ne peuvent masquer un écart prouvé."""
+    """PBT-03 : le score et la provenance ne masquent jamais un bloqueur critique."""
     proof_url = URL if source_type == "web_officiel" else (
         "https://distributor.example/products/ref-1"
     )
+    excerpt = ". ".join(_PLACEHOLDER_PHRASES[:3] + _PLACEHOLDER_INCOMPATIBLE_PHRASES[3:4])
     candidate = _candidate(
         ["proven", "proven", "proven", "incompatible"],
         proof=SourceProof(
             url=proof_url,
-            excerpt="Tension de commande 24 V DC",
+            excerpt=excerpt,
             type=source_type,
         ),
     )
 
     evaluation = evaluate_candidates(
-        _requirements(4),
+        _requirements(4, critical={"r4"}),
         [PageAudit(page_url=proof_url, candidates=[candidate])],
         target_brand="Norel",
         threshold=threshold,
-        visited_pages={proof_url: f"Norel REF-1. {CONTENT}"},
+        visited_pages={proof_url: f"Norel REF-1. {excerpt}"},
     )[0]
 
     assert evaluation.summary.incompatible_criteria == ["Critère 4"]
@@ -377,16 +452,19 @@ def test_verified_incompatibility_is_never_eligible_for_any_source_or_threshold(
     assert not evaluation.complete
 
 
-def test_any_verified_incompatibility_excludes_candidate_even_when_not_critical():
-    """Un pourcentage élevé ne doit jamais masquer un écart technique établi."""
+def test_noncritical_incompatibility_lowers_score_without_vetoing_candidate():
+    """Un écart secondaire reste visible mais ne bloque pas le seuil de 75 %."""
     evaluation = _evaluate(
         _requirements(4),
         _candidate(["proven", "proven", "proven", "incompatible"]),
+        pages={URL: _CONTENT_WITH_R4_INCOMPATIBLE},
     )
 
     assert evaluation.summary.score == 75
     assert evaluation.summary.incompatible_criteria == ["Critère 4"]
-    assert not evaluation.eligible
+    assert evaluation.summary.critical_blockers == []
+    assert evaluation.eligible
+    assert not evaluation.complete
 
 
 def test_official_proofs_without_the_candidate_reference_do_not_confirm_identity():
@@ -569,50 +647,88 @@ def test_excerpt_must_exist_in_recovered_page():
         _evaluate(_requirements(1), candidate)
 
 
-def test_typographic_apostrophe_does_not_break_the_excerpt_match():
-    """CAP-3 : une apostrophe typographique sur la page n'invalide pas l'extrait."""
+def _requirement_matching(value: str) -> RequirementSet:
+    """Un seul critère, dont la valeur demandée est celle que le test vérifie.
+
+    Distinct de `_requirements()` : ces tests portent sur la tolérance de la
+    correspondance elle-même (apostrophe, tiret, trait d'union conditionnel),
+    jamais sur un rapport de score — la valeur doit donc être celle citée
+    dans l'extrait dédié du test, pas un placeholder générique partagé.
+    """
+    return RequirementSet(
+        product="Contacteur source",
+        criteria=[Requirement(id="r1", label="Critère 1", requested_value=value)],
+    )
+
+
+def test_typographic_apostrophe_variant_is_not_an_exact_quote():
     candidate = _candidate(
         ["proven"],
         proof=SourceProof(url=URL, excerpt="L'appareil se règle", type="web_officiel"),
     )
+    candidate.criteria[0].requested_value = candidate.criteria[0].observed_value = (
+        "L'appareil se règle"
+    )
 
-    _evaluate(_requirements(1), candidate, pages={URL: "Notice : L’appareil se règle en usine."})
+    with pytest.raises(EvidenceContractError, match="Extrait absent"):
+        _evaluate(
+            _requirement_matching("L'appareil se règle"),
+            candidate,
+            pages={URL: "Notice : L’appareil se règle en usine."},
+        )
 
 
-def test_dash_variant_does_not_break_the_excerpt_match():
-    """CAP-3 : un tiret cadratin sur la page n'invalide pas l'extrait."""
+def test_dash_variant_is_not_an_exact_quote():
     candidate = _candidate(
         ["proven"],
         proof=SourceProof(url=URL, excerpt="Courant 9-16 A", type="web_officiel"),
     )
+    candidate.criteria[0].requested_value = candidate.criteria[0].observed_value = (
+        "Courant 9-16 A"
+    )
 
-    _evaluate(_requirements(1), candidate, pages={URL: "Plage : Courant 9–16 A en sortie."})
+    with pytest.raises(EvidenceContractError, match="Extrait absent"):
+        _evaluate(
+            _requirement_matching("Courant 9-16 A"),
+            candidate,
+            pages={URL: "Plage : Courant 9–16 A en sortie."},
+        )
 
 
-def test_soft_hyphen_does_not_break_the_excerpt_match():
-    """CAP-3 : un trait d'union conditionnel invisible n'invalide pas l'extrait."""
+def test_soft_hyphen_variant_is_not_an_exact_quote():
     candidate = _candidate(
         ["proven"],
         proof=SourceProof(url=URL, excerpt="Disjoncteur triphasé", type="web_officiel"),
     )
+    candidate.criteria[0].requested_value = candidate.criteria[0].observed_value = (
+        "Disjoncteur triphasé"
+    )
 
-    _evaluate(_requirements(1), candidate, pages={URL: "Dis­joncteur triphasé pour tableau."})
+    with pytest.raises(EvidenceContractError, match="Extrait absent"):
+        _evaluate(
+            _requirement_matching("Disjoncteur triphasé"),
+            candidate,
+            pages={URL: "Dis­joncteur triphasé pour tableau."},
+        )
 
 
-def test_all_four_unicode_variants_combined_still_match():
-    """CAP-3 : apostrophe, tiret, trait d'union conditionnel et accents combinés."""
+def test_combined_unicode_variants_are_not_an_exact_quote():
     candidate = _candidate(
         ["proven"],
         proof=SourceProof(
             url=URL, excerpt="L'appareil - 9-16 A - reference", type="web_officiel"
         ),
     )
-
-    _evaluate(
-        _requirements(1),
-        candidate,
-        pages={URL: "Notice : L’appareil – 9–16 A – ré­férence certifiée."},
+    candidate.criteria[0].requested_value = candidate.criteria[0].observed_value = (
+        "L'appareil - 9-16 A - reference"
     )
+
+    with pytest.raises(EvidenceContractError, match="Extrait absent"):
+        _evaluate(
+            _requirement_matching("L'appareil - 9-16 A - reference"),
+            candidate,
+            pages={URL: "Notice : L’appareil – 9–16 A – ré­férence certifiée."},
+        )
 
 
 def test_audit_must_cover_exact_immutable_ids_and_values():
@@ -660,8 +776,14 @@ def test_requested_value_uses_unicode_proof_normalization():
     candidate.criteria[0].requested_value = (
         "Re\u0301fe\u0301rence XZ07\u201320\u201310\u201311 d\u2019Norel"
     )
+    candidate.criteria[0].observed_value = "Reference XZ07-20-10-11 d'Norel"
+    candidate.criteria[0].proofs[0].excerpt = "Reference XZ07-20-10-11 d'Norel"
 
-    evaluation = _evaluate(requirements, candidate)
+    evaluation = _evaluate(
+        requirements,
+        candidate,
+        pages={URL: "Reference XZ07-20-10-11 d'Norel"},
+    )
 
     assert evaluation.summary.score == 100
 
@@ -954,9 +1076,11 @@ def test_origin_identity_is_non_applicable_but_family_and_usage_are_scored():
             ),
         ],
     )
-    proof = SourceProof(
-        url=URL, excerpt="Tension de commande 24 V DC", type="web_officiel"
+    excerpt = (
+        "Norel XZ07-20-10-11. Contacteur pour commande moteur. "
+        "Tension de commande 24 V DC."
     )
+    proof = SourceProof(url=URL, excerpt=excerpt, type="web_officiel")
     candidate = CandidateAudit(
         brand="Norel",
         reference="XZ07-20-10-11",
@@ -992,11 +1116,7 @@ def test_origin_identity_is_non_applicable_but_family_and_usage_are_scored():
         ],
     )
 
-    evaluation = _evaluate(
-        requirements,
-        candidate,
-        pages={URL: f"{CONTENT} XZ07-20-10-11"},
-    )
+    evaluation = _evaluate(requirements, candidate, pages={URL: excerpt})
 
     assert evaluation.summary.score == 100
     assert evaluation.summary.non_applicable_criteria == [
@@ -1027,9 +1147,11 @@ def test_origin_identity_value_is_non_applicable_regardless_of_label():
             Requirement(id="usage", label="Usage", requested_value="Commande moteur"),
         ],
     )
-    proof = SourceProof(
-        url=URL, excerpt="Tension de commande 24 V DC", type="web_officiel"
+    excerpt = (
+        "Norel identité Norel. Contacteur de puissance tripolaire. "
+        "Courant 9 A. Tension de commande 24 V DC. Commande moteur."
     )
+    proof = SourceProof(url=URL, excerpt=excerpt, type="web_officiel")
     candidate = CandidateAudit(
         brand="Norel",
         reference="XZ07-20-10-11",
@@ -1047,7 +1169,7 @@ def test_origin_identity_value_is_non_applicable_regardless_of_label():
         ],
     )
 
-    evaluation = _evaluate(requirements, candidate)
+    evaluation = _evaluate(requirements, candidate, pages={URL: excerpt})
 
     assert evaluation.summary.non_applicable_criteria == [
         "Origine A", "Origine B", "Origine C"
@@ -1056,6 +1178,26 @@ def test_origin_identity_value_is_non_applicable_regardless_of_label():
         "Fonction", "Courant", "Bobine", "Usage"
     ]
     assert evaluation.summary.score == 100
+
+
+def test_compact_technical_values_are_not_mistaken_for_source_references():
+    requirements = RequirementSet(
+        product="KVR32S22S8/16 16GB DDR4-3200 CL22 SDRAM",
+        origin_brand="Kingston ValueRAM",
+        criteria=[
+            Requirement(id="reference", label="Référence", requested_value="KVR32S22S8/16"),
+            Requirement(id="capacity", label="Capacité", requested_value="16GB"),
+            Requirement(id="memory", label="Type mémoire", requested_value="DDR4-3200"),
+            Requirement(id="latency", label="Latence", requested_value="CL22"),
+            Requirement(id="module", label="Module", requested_value="SODIMM"),
+        ],
+    )
+
+    notable = criteres_notables(requirements)
+
+    assert [item.id for item in notable.criteria] == [
+        "capacity", "memory", "latency", "module",
+    ]
 
 
 def test_more_than_half_origin_identity_values_reject_the_requirement_set():
@@ -1347,18 +1489,634 @@ def _windowed_evaluation(
     )[0]
 
 
-def test_non_contiguous_tokens_inside_window_are_proven_and_graded_windowed():
-    """Une ligne de tableau aplatie reste une preuve bornée, jamais une citation exacte."""
+def test_non_contiguous_tokens_inside_window_are_rejected_as_non_literal():
+    """Une citation reconstruite ne satisfait pas le contrat littéral."""
     evaluation = _windowed_evaluation(
-        "XZ07-20-10-11 24...60 20...60 3 0 1 0",
-        "Table Norel : XZ07-20-10-11 | 24...60 | 20...60 | 3 | 0 | 1 | 0",
+        "XZ07-20-10-11 24...60 V DC 20...60 3 0 1 0",
+        "Table Norel : XZ07-20-10-11 | 24...60 | V | DC | 20...60 | 3 | 0 | 1 | 0",
+    )
+
+    assert evaluation.summary.score == 0
+    assert evaluation.summary.proven_criteria == []
+    assert evaluation.summary.rejected_proof_criteria == ["Tension de bobine"]
+    assert evaluation.summary.proof_grades == {}
+    assert not evaluation.complete
+
+
+def test_model_whitespace_is_replaced_by_the_exact_page_span_before_validation():
+    evaluation = _windowed_evaluation(
+        "Control voltage 24 V DC",
+        "Control voltage\n24 V DC",
+        observed_value="24 V DC",
     )
 
     assert evaluation.summary.score == 100
-    assert evaluation.summary.proven_criteria == ["Tension de bobine"]
     assert evaluation.summary.rejected_proof_criteria == []
-    assert evaluation.summary.proof_grades == {"Tension de bobine": "windowed"}
-    assert evaluation.complete
+    assert evaluation.candidate.criteria[0].proofs[0].excerpt == (
+        "Control voltage\n24 V DC"
+    )
+
+
+def test_compact_observed_quantity_matches_the_exact_split_page_value():
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(id="bore", label="Bore diameter", requested_value="25 mm")],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="bore",
+            requested_value="25 mm",
+            observed_value="25mm",
+            status="proven",
+            proofs=[SourceProof(
+                url=URL,
+                excerpt="BORE DIAMETER 25 MM",
+                type="web_secondaire",
+            )],
+        )],
+    )
+    content = "Maker ALT-205\nBORE DIAMETER\n25\nMM"
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: content},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 100
+    assert evaluation.candidate.criteria[0].proofs[0].excerpt == (
+        "BORE DIAMETER\n25\nMM"
+    )
+
+
+def test_accent_only_model_rewrite_is_replaced_by_exact_page_span():
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(id="width", label="Width", requested_value="15 mm")],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="width",
+            requested_value="15 mm",
+            observed_value="15 MM",
+            status="proven",
+            proofs=[SourceProof(
+                url=URL,
+                excerpt="ÉPAISSEUR 15 MM",
+                type="web_secondaire",
+            )],
+        )],
+    )
+    content = "Maker ALT-205\nEPAISSEUR\n15\nMM"
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: content},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 100
+    assert evaluation.candidate.criteria[0].proofs[0].excerpt == "EPAISSEUR\n15\nMM"
+
+
+def test_recommended_product_identity_cannot_borrow_main_product_specs():
+    url = "https://shop.example/products/alt-205-maker"
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(id="bore", label="Bore", requested_value="25 mm")],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="NEIGHBOR-204",
+        criteria=[CriterionAudit(
+            requirement_id="bore",
+            requested_value="25 mm",
+            observed_value="25 mm",
+            status="proven",
+            proofs=[SourceProof(
+                url=url,
+                excerpt="Bore\n25 mm",
+                type="web_secondaire",
+            )],
+        )],
+    )
+    content = (
+        "Reference ALT-205 by Maker\n"
+        "CUSTOMERS ALSO BOUGHT\n"
+        "Maker NEIGHBOR-204\n"
+        "TECHNICAL DATA\nBore\n25 mm"
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=url, candidates=[candidate])],
+        target_brand=None,
+        threshold=75,
+        visited_pages={url: content},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 0
+    assert not evaluation.eligible
+
+
+def test_recommended_candidate_cannot_borrow_the_main_product_technical_block():
+    """Une identité en recommandation découvre une piste, jamais ses spécifications."""
+    url = "https://shop.example/products/main-200"
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(id="bore", label="Bore diameter", requested_value="25 mm")],
+    )
+    candidate = CandidateAudit(
+        brand="Other",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="bore",
+            requested_value="25 mm",
+            observed_value="25 mm",
+            status="proven",
+            proofs=[SourceProof(
+                url=url,
+                excerpt="Bore diameter: 25 mm",
+                type="web_secondaire",
+            )],
+        )],
+    )
+    content = (
+        "Maker MAIN-200\nBore diameter: 25 mm\n"
+        "CUSTOMERS ALSO BOUGHT\nOther ALT-205"
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=url, candidates=[candidate])],
+        target_brand=None,
+        threshold=75,
+        visited_pages={url: content},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 0
+    assert evaluation.summary.proven_criteria == []
+    assert evaluation.summary.rejected_proof_criteria == ["Bore diameter"]
+
+
+def test_outside_diameter_does_not_prove_bore_diameter():
+    """Une valeur égale ne suffit pas lorsque l'axe géométrique diffère."""
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(id="bore", label="Bore diameter", requested_value="25 mm")],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="bore",
+            requested_value="25 mm",
+            observed_value="25 mm",
+            status="proven",
+            proofs=[SourceProof(
+                url=URL,
+                excerpt="Outside diameter: 25 mm",
+                type="web_secondaire",
+            )],
+        )],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: "Maker ALT-205\nOutside diameter: 25 mm"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 0
+    assert evaluation.summary.rejected_proof_criteria == ["Bore diameter"]
+
+
+def test_open_sides_does_not_prove_sealed_sides():
+    """Des mots communs ne doivent pas masquer une formulation opposée."""
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(
+            id="sealing", label="Sealing", requested_value="Both sides sealed",
+        )],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="sealing",
+            requested_value="Both sides sealed",
+            observed_value="Both sides open",
+            status="proven",
+            proofs=[SourceProof(
+                url=URL,
+                excerpt="Both sides open",
+                type="web_secondaire",
+            )],
+        )],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: "Maker ALT-205\nBoth sides open"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 0
+    assert evaluation.summary.proven_criteria == []
+
+
+def test_literal_double_face_seals_correct_a_false_incompatible_audit():
+    """Un autre code fabricant ne contredit pas des joints sur les deux faces."""
+    requested = "un joint sur les deux côtés"
+    excerpt = (
+        "Doté de joints en caoutchouc double face (2RS), ce roulement assure "
+        "une protection efficace contre la poussière."
+    )
+    requirements = RequirementSet(
+        product="Source bearing ZX-2RSH",
+        criteria=[Requirement(
+            id="seal_type", label="type d'étanchéité", requested_value=requested,
+        )],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="seal_type",
+            requested_value=requested,
+            observed_value="2RS",
+            status="incompatible",
+            proofs=[SourceProof(url=URL, excerpt=excerpt, type="web_secondaire")],
+        )],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: f"Maker ALT-205\n{excerpt}"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 100
+    assert evaluation.summary.proven_criteria == ["type d'étanchéité"]
+    assert evaluation.eligible
+
+
+def test_audit_prompt_compares_function_before_manufacturer_suffix():
+    requirements = RequirementSet(
+        product="Source bearing AX205-2RSH",
+        criteria=[Requirement(
+            id="sealing", label="Sealing", requested_value="a seal on both sides",
+        )],
+    )
+
+    prompt = construire_mission_audit(requirements, None, URL)
+
+    assert "code fabricant" in prompt
+    assert "fonction" in prompt
+
+
+def test_shields_do_not_prove_a_source_requirement_for_seals_on_both_sides():
+    """`ZZ` décrit des écrans, pas les joints explicitement demandés."""
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(
+            id="sealing", label="Sealing", requested_value="with seals on both sides",
+        )],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205-ZZ",
+        criteria=[CriterionAudit(
+            requirement_id="sealing",
+            requested_value="with seals on both sides",
+            observed_value="Shielded on both sides",
+            status="proven",
+            proofs=[SourceProof(
+                url=URL,
+                excerpt="Shielded on both sides",
+                type="web_secondaire",
+            )],
+        )],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: "Maker ALT-205-ZZ\nShielded on both sides"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 0
+    assert evaluation.summary.proven_criteria == []
+
+
+def test_compact_pole_count_is_proven_by_the_explicit_wording():
+    """`3P` et `3 poles` sont la même valeur lorsque la propriété est citée."""
+    requirements = RequirementSet(
+        product="Source contactor",
+        criteria=[Requirement(id="poles", label="Number of poles", requested_value="3P")],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="poles",
+            requested_value="3P",
+            observed_value="3 poles",
+            status="proven",
+            proofs=[SourceProof(
+                url=URL,
+                excerpt="Number of poles: 3 poles",
+                type="web_secondaire",
+            )],
+        )],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: "Maker ALT-205\nNumber of poles: 3 poles"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 100
+    assert evaluation.summary.proven_criteria == ["Number of poles"]
+
+
+def test_stock_number_is_not_a_compatibility_criterion():
+    """Une référence commerciale différente ne réduit pas le score technique."""
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[
+            Requirement(id="bore", label="Bore diameter", requested_value="25 mm"),
+            Requirement(id="stock", label="Stock No.", requested_value="7822"),
+        ],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[
+            CriterionAudit(
+                requirement_id="bore", requested_value="25 mm",
+                observed_value="25 mm", status="proven",
+                proofs=[SourceProof(url=URL, excerpt="Bore diameter: 25 mm", type="web_secondaire")],
+            ),
+            CriterionAudit(
+                requirement_id="stock", requested_value="7822",
+                observed_value="9999", status="incompatible",
+                proofs=[SourceProof(url=URL, excerpt="Stock No.: 9999", type="web_secondaire")],
+            ),
+        ],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: "Maker ALT-205\nBore diameter: 25 mm\nStock No.: 9999"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 100
+    assert evaluation.summary.incompatible_criteria == []
+
+
+def test_unknown_secondary_criterion_remains_in_the_score_denominator():
+    """Le score reste comparable entre candidats malgré une donnée manquante."""
+    url = "https://maker.example/products/alt-205"
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[
+            Requirement(id="bore", label="Bore diameter", requested_value="25 mm", critical=True),
+            Requirement(id="speed", label="Limiting speed", requested_value="8500 rpm", critical=False),
+            Requirement(id="material", label="Material", requested_value="Steel", critical=False),
+        ],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[
+            CriterionAudit(
+                requirement_id="bore", requested_value="25 mm", observed_value="25 mm",
+                status="proven", proofs=[SourceProof(
+                    url=url, excerpt="Bore diameter: 25 mm", type="web_secondaire",
+                )],
+            ),
+            CriterionAudit(requirement_id="speed", requested_value="8500 rpm", status="not_proven"),
+            CriterionAudit(requirement_id="material", requested_value="Steel", status="not_proven"),
+        ],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=url, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={url: "Maker ALT-205\nBore diameter: 25 mm"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 33
+    assert not evaluation.eligible
+
+
+def test_counted_french_recommendation_cannot_borrow_main_product_specs():
+    url = "https://shop.example/products/alt-205-maker"
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(id="bore", label="Bore", requested_value="25 mm")],
+    )
+    candidate = CandidateAudit(
+        brand="Other",
+        reference="NEIGHBOR-204",
+        criteria=[CriterionAudit(
+            requirement_id="bore",
+            requested_value="25 mm",
+            observed_value="25 mm",
+            status="proven",
+            proofs=[SourceProof(
+                url=url,
+                excerpt="Bore\n25 mm",
+                type="web_secondaire",
+            )],
+        )],
+    )
+    content = (
+        "Reference ALT-205 by Maker\nBore\n25 mm\n"
+        "4 autres produits sélectionnés pour vous\n"
+        "Ref: NEIGHBOR-204 - Other"
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=url, candidates=[candidate])],
+        target_brand=None,
+        threshold=75,
+        visited_pages={url: content},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 0
+    assert not evaluation.eligible
+
+
+def test_embedded_reference_fragment_cannot_confirm_candidate_identity():
+    url = "https://maker.example/products/2050-axc3-5k"
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[Requirement(id="bore", label="Bore", requested_value="25 mm")],
+    )
+    content = "Maker 2050 AXC3/5K\nBore: 25 mm"
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="AXC3",
+        criteria=[CriterionAudit(
+            requirement_id="bore",
+            requested_value="25 mm",
+            observed_value="25 mm",
+            status="proven",
+            proofs=[SourceProof(
+                url=url,
+                excerpt="Bore: 25 mm",
+                type="web_secondaire",
+            )],
+        )],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=url, candidates=[candidate])],
+        target_brand=None,
+        threshold=75,
+        visited_pages={url: content},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 100
+    assert not evaluation.eligible
+
+
+def test_noncritical_unknowns_reduce_the_comparable_score():
+    url = "https://maker.example/products/alt-205"
+    requirements = RequirementSet(
+        product="Source bearing",
+        criteria=[
+            Requirement(
+                id="bore", label="Bore", requested_value="25 mm", critical=True,
+            ),
+            Requirement(
+                id="speed", label="Limiting speed", requested_value="8500 rpm",
+                critical=False,
+            ),
+            Requirement(
+                id="material", label="Material", requested_value="Steel",
+                critical=False,
+            ),
+        ],
+    )
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[
+            CriterionAudit(
+                requirement_id="bore",
+                requested_value="25 mm",
+                observed_value="25 mm",
+                status="proven",
+                proofs=[SourceProof(
+                    url=url,
+                    excerpt="Maker ALT-205\nBore: 25 mm",
+                    type="web_secondaire",
+                )],
+            ),
+            CriterionAudit(
+                requirement_id="speed",
+                requested_value="8500 rpm",
+                status="not_proven",
+            ),
+            CriterionAudit(
+                requirement_id="material",
+                requested_value="Steel",
+                status="not_proven",
+            ),
+        ],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=url, candidates=[candidate])],
+        target_brand=None,
+        threshold=75,
+        visited_pages={url: "Maker ALT-205\nBore: 25 mm"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 33
+    assert evaluation.summary.not_proven_criteria == ["Limiting speed", "Material"]
+    assert not evaluation.eligible
+    assert not evaluation.complete
+
+
+def test_textual_proven_value_requires_the_requested_value_in_the_quote():
+    requirements = RequirementSet(
+        product="Sealed bearing",
+        criteria=[Requirement(
+            id="seal_type",
+            label="Sealing type",
+            requested_value="Contact",
+        )],
+    )
+    excerpt = "Sealing material\nRubber"
+    candidate = CandidateAudit(
+        brand="Maker",
+        reference="ALT-205",
+        criteria=[CriterionAudit(
+            requirement_id="seal_type",
+            requested_value="Contact",
+            observed_value="Rubber",
+            status="proven",
+            proofs=[SourceProof(url=URL, excerpt=excerpt, type="web_secondaire")],
+        )],
+    )
+
+    evaluation = evaluate_candidates(
+        requirements,
+        [PageAudit(page_url=URL, candidates=[candidate])],
+        target_brand="Maker",
+        threshold=75,
+        visited_pages={URL: f"Maker ALT-205\n{excerpt}"},
+        strict_evidence=False,
+    )[0]
+
+    assert evaluation.summary.score == 0
+    assert evaluation.summary.proven_criteria == []
+    assert evaluation.summary.rejected_proof_criteria == ["Sealing type"]
 
 
 def test_contiguous_excerpt_keeps_the_stronger_grade():
@@ -1408,8 +2166,8 @@ def test_windowed_excerpt_requires_repeated_tokens_to_repeat_in_content():
 
 def test_windowed_proof_does_not_override_ac_dc_mismatch():
     evaluation = _windowed_evaluation(
-        "XZ07-20-10-11 24 60",
-        "XZ07-20-10-11 | 24 | 60",
+        "Voltage range 24...60 V AC",
+        "Voltage range 24...60 V AC",
         observed_value="24...60 V AC",
         status="incompatible",
     )
@@ -1417,13 +2175,13 @@ def test_windowed_proof_does_not_override_ac_dc_mismatch():
     assert evaluation.summary.score == 0
     assert evaluation.summary.incompatible_criteria == ["Tension de bobine"]
     assert evaluation.summary.critical_blockers == ["Tension de bobine"]
-    assert evaluation.summary.proof_grades == {"Tension de bobine": "windowed"}
+    assert evaluation.summary.proof_grades == {"Tension de bobine": "contiguous"}
 
 
 def test_model_proven_status_cannot_override_ac_dc_mismatch():
     evaluation = _windowed_evaluation(
-        "XZ07-20-10-11 24 60",
-        "XZ07-20-10-11 | 24 | 60",
+        "Voltage range 24...60 V AC",
+        "Voltage range 24...60 V AC",
         observed_value="24...60 V AC",
         status="proven",
     )
@@ -2286,6 +3044,46 @@ def test_main_no_contact_evidence_accepts_the_explicit_norel_wording():
     assert _contact_no_evidence(requirement, wording)
 
 
+def test_explicit_norel_main_no_wording_proves_the_requested_contact_value():
+    """La formulation ETIM « a fermeture » porte bien le sens de 3 NO."""
+    from compatibilite import _textual_requested_value_is_explicit
+
+    requirement = Requirement(
+        id="contacts", label="Contacts principaux", requested_value="3 NO",
+    )
+    criterion = CriterionAudit(
+        requirement_id="contacts",
+        requested_value="3 NO",
+        observed_value=(
+            "Nombre de contacts a fermeture en tant que contacts principaux: 3"
+        ),
+        status="proven",
+    )
+
+    assert _textual_requested_value_is_explicit(
+        requirement, criterion, criterion.observed_value,
+    )
+
+
+def test_explicit_motor_command_wording_proves_one_requested_usage_branch():
+    """Une valeur d'usage séparée par `/` accepte une branche littérale."""
+    from compatibilite import _textual_requested_value_is_explicit
+
+    requirement = Requirement(
+        id="usage", label="Usage vise", requested_value="Commande de moteur / charge industrielle",
+    )
+    criterion = CriterionAudit(
+        requirement_id="usage",
+        requested_value=requirement.requested_value,
+        observed_value="Utilise pour la commande de moteurs triphases",
+        status="proven",
+    )
+
+    assert _textual_requested_value_is_explicit(
+        requirement, criterion, criterion.observed_value,
+    )
+
+
 def test_main_no_contact_evidence_skips_auxiliary_clause_before_norel_wording():
     from compatibilite import _contact_no_evidence
 
@@ -2440,6 +3238,17 @@ def test_a_purely_technical_requirement_set_reaches_the_audit_untouched():
         assert requirement.label in prompt
 
 
+def test_audit_prompt_requires_a_product_property_value_proof_tuple():
+    prompt = construire_mission_audit(
+        _requirements(1), "Norel", "https://norelab.example/p",
+    )
+
+    assert "produit et variante" in prompt
+    assert "propriété demandée" in prompt
+    assert "propriété réellement décrite" in prompt
+    assert "négation" in prompt
+
+
 def test_a_product_name_alone_proves_nothing_even_on_an_official_page():
     """Rupture visée : 100 % « complete » sur une page sans donnée technique.
 
@@ -2521,3 +3330,81 @@ def test_a_value_bearing_excerpt_is_still_a_proof():
     )
 
     assert evaluations[0].summary.proven_criteria == ["Courant nominal"]
+
+
+def test_an_identity_excerpt_with_unrelated_filler_proves_nothing():
+    """Rupture visée : une identité plus du bruit ne prouve pas une valeur.
+
+    Mesure du 2026-09-15 sur un run réel (Schneider LC1D09BD, contacteur) :
+    une annonce agrégée par picclick.fr — « 1PC NEW SIEMENS 3TF2000-6BB40-0KC0
+    Contactor Free Shipping High quality EUR 168,50 » — a été citée comme
+    preuve de la tension de bobine. L'extrait porte la marque et la référence,
+    plus du texte commercial (« Free Shipping High quality »), mais aucune
+    tension. `_excerpt_is_only_an_identity` ne l'attrapait pas : il reste du
+    texte une fois l'identité retirée ; ce texte n'a simplement rien à voir
+    avec le critère qu'il est censé prouver.
+    """
+    url = "https://picclick.fr/exemple"
+    contenu = (
+        "1PC NEW SIEMENS 3TF2000-6BB40-0KC0 Contactor Free Shipping High "
+        "quality EUR 168,50"
+    )
+    requirements = RequirementSet(
+        product="Contactor (TeSys D) Non-Reversing",
+        criteria=[
+            Requirement(id="coil_voltage", label="Coil Voltage", requested_value="24Vdc"),
+        ],
+    )
+    audit = PageAudit(page_url=url, candidates=[CandidateAudit(
+        brand="Siemens",
+        reference="3TF2000-6BB40-0KC0",
+        criteria=[CriterionAudit(
+            requirement_id="coil_voltage",
+            requested_value="24Vdc",
+            observed_value="24Vdc",
+            status="proven",
+            proofs=[SourceProof(url=url, excerpt=contenu, type="web_secondaire")],
+        )],
+    )])
+
+    evaluations = evaluate_candidates(
+        requirements, [audit], "Siemens", 75, {url: contenu}, strict_evidence=False,
+    )
+
+    assert evaluations[0].summary.proven_criteria == []
+    assert evaluations[0].summary.score == 0
+
+
+def test_an_identity_excerpt_still_proves_a_criterion_it_actually_states():
+    """Le même genre d'extrait doit rester une preuve s'il énonce la valeur.
+
+    Contre-épreuve du test précédent : une identité suivie de texte qui, cette
+    fois, énonce bien la valeur du critère. La garde de pertinence ne doit
+    rejeter que les critères que l'extrait ne mentionne pas, jamais un critère
+    que l'extrait énonce réellement.
+    """
+    url = "https://distributeur.example/p/3rt1025-1ap00"
+    contenu = "Siemens 3RT1025-1AP00 dispose de 3 poles."
+    requirements = RequirementSet(
+        product="Contactor (TeSys D) Non-Reversing",
+        criteria=[
+            Requirement(id="number_of_poles", label="Number of Poles", requested_value="3 poles"),
+        ],
+    )
+    audit = PageAudit(page_url=url, candidates=[CandidateAudit(
+        brand="Siemens",
+        reference="3RT1025-1AP00",
+        criteria=[CriterionAudit(
+            requirement_id="number_of_poles",
+            requested_value="3 poles",
+            observed_value="3 poles",
+            status="proven",
+            proofs=[SourceProof(url=url, excerpt=contenu, type="web_secondaire")],
+        )],
+    )])
+
+    evaluations = evaluate_candidates(
+        requirements, [audit], "Siemens", 75, {url: contenu}, strict_evidence=False,
+    )
+
+    assert evaluations[0].summary.proven_criteria == ["Number of Poles"]

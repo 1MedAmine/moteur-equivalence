@@ -176,6 +176,12 @@ _ORIGIN_IDENTITY_LABEL_HINTS: tuple[str, ...] = (
     "reference",
     "mpn",
     "part number",
+    "stock no",
+    "stock number",
+    "numero stock",
+    "numero de stock",
+    "sku",
+    "order number",
 )
 
 
@@ -233,6 +239,29 @@ _PREFIX_MODE_PATTERN = re.compile(
     rf"\b(?P<mode>{_MODE})\b\s*[:=]?\s*$",
     re.IGNORECASE,
 )
+_DIMENSION_TRIPLET_PATTERN = re.compile(
+    rf"(?<![\d.,])(?P<first>{_NUMBER})\s*[x×]\s*"
+    rf"(?P<second>{_NUMBER})\s*[x×]\s*"
+    rf"(?P<third>{_NUMBER})\s*(?P<unit>mm|cm|m)(?!\w)",
+    re.IGNORECASE,
+)
+_DIMENSION_AXIS_HINTS = (
+    (
+        0,
+        (
+            "bore", "inside diameter", "inner diameter", "internal diameter",
+            "alesage", "diametre interieur",
+        ),
+    ),
+    (
+        1,
+        (
+            "outside diameter", "outer diameter", "external diameter",
+            "diametre exterieur",
+        ),
+    ),
+    (2, ("width", "largeur", "thickness", "epaisseur")),
+)
 
 
 def _decimal(value: str) -> Decimal | None:
@@ -240,6 +269,42 @@ def _decimal(value: str) -> Decimal | None:
         return Decimal(value.replace(",", "."))
     except InvalidOperation:
         return None
+
+
+def _dimension_triplet_matches(
+    requirement: Requirement,
+    observed_value: str,
+) -> bool | None:
+    """Compare un triplet dimensionnel compact selon l'axe nommé du critère."""
+    requested = _POINT_PATTERN.search(_normalized_proof(requirement.requested_value))
+    observed = _DIMENSION_TRIPLET_PATTERN.search(
+        _normalized_proof(observed_value)
+    )
+    if requested is None or observed is None:
+        return None
+    requested_unit, requested_modes = _quantity_signature_at(
+        _normalized_proof(requirement.requested_value), requested,
+    )
+    observed_unit, observed_modes = _quantity_signature(
+        observed.group("unit"), None,
+    )
+    if requested_modes or observed_modes or requested_unit != observed_unit:
+        return None
+    identity = _normalized_proof(f"{requirement.id} {requirement.label}")
+    axis = next((
+        index
+        for index, hints in _DIMENSION_AXIS_HINTS
+        if any(hint in identity for hint in hints)
+    ), None)
+    if axis is None:
+        return None
+    requested_number = _decimal(requested.group("value"))
+    observed_number = _decimal(
+        observed.group(("first", "second", "third")[axis])
+    )
+    if requested_number is None or observed_number is None:
+        return None
+    return observed_number == requested_number
 
 
 def _quantity_signature(unit: str, mode: str | None) -> tuple[str, frozenset[str]]:
@@ -356,10 +421,12 @@ def _effective_status(requirement: Requirement, criterion: CriterionAudit) -> st
         _POINT_PATTERN.search(_normalized_proof(requirement.requested_value)) is not None
     )
     if criterion.status == "proven" and requested_is_quantity:
-        comparison = _range_contains_requested(
-            requirement.requested_value,
-            criterion.observed_value,
-        )
+        comparison = _dimension_triplet_matches(requirement, criterion.observed_value)
+        if comparison is None:
+            comparison = _range_contains_requested(
+                requirement.requested_value,
+                criterion.observed_value,
+            )
         if comparison is True:
             return "proven"
         if comparison is False:
@@ -370,16 +437,106 @@ def _effective_status(requirement: Requirement, criterion: CriterionAudit) -> st
     if not criterion.observed_value.strip():
         return "not_proven"
     if not requested_is_quantity:
+        if any(
+            _double_sided_seal_evidence(requirement.requested_value, proof.excerpt)
+            for proof in criterion.proofs
+        ):
+            return "proven"
         return "incompatible"
-    comparison = _range_contains_requested(
-        requirement.requested_value,
-        criterion.observed_value,
-    )
+    comparison = _dimension_triplet_matches(requirement, criterion.observed_value)
+    if comparison is None:
+        comparison = _range_contains_requested(
+            requirement.requested_value,
+            criterion.observed_value,
+        )
     if comparison is True:
         return "proven"
     if comparison is False:
         return "incompatible"
     return "not_proven"
+
+
+def _textual_requested_value_is_explicit(
+    requirement: Requirement,
+    criterion: CriterionAudit,
+    excerpt: str,
+) -> bool:
+    if _POINT_PATTERN.search(_normalized_proof(requirement.requested_value)) is not None:
+        return True
+    if _double_sided_seal_evidence(requirement.requested_value, excerpt):
+        return True
+    requested = _normalized_proof(requirement.requested_value)
+    observed = _normalized_proof(criterion.observed_value)
+    excerpt_text = _normalized_proof(excerpt)
+    if requested and (requested in observed or requested in excerpt_text):
+        return True
+    compact_poles = re.fullmatch(r"(\d+)p", requested)
+    if compact_poles and re.search(
+        rf"\b{compact_poles.group(1)}\s*poles?\b", excerpt_text,
+    ):
+        return True
+    # Certaines fiches ETIM emploient une formulation développée, mais non
+    # ambiguë : « contacts à fermeture … principaux : 3 » pour `3 NO`.
+    # De même, une valeur d'usage peut exprimer plusieurs destinations avec
+    # `/`; une branche explicitement énoncée suffit. Ces deux lecteurs ne
+    # renvoient une preuve que si propriété, sens et valeur sont réunis dans
+    # le même extrait littéral.
+    if _contact_no_evidence(requirement, excerpt_text):
+        return True
+    if _usage_evidence(requirement, excerpt_text):
+        return True
+    stopwords = {"a", "an", "and", "de", "des", "du", "et", "la", "le", "les", "of", "on", "the"}
+    requested_tokens = {
+        token for token in _PROOF_TOKEN_PATTERN.findall(requested)
+        if len(token) >= 3 and token not in stopwords
+    }
+    observed_tokens = {
+        token for token in _PROOF_TOKEN_PATTERN.findall(observed)
+        if len(token) >= 3 and token not in stopwords
+    }
+    if not requested_tokens:
+        return False
+    # Les mots de structure seuls (`both sides`) ne peuvent pas démontrer une
+    # propriété. Sans ce contrôle, « both sides open » validait « both sides
+    # sealed » parce que les deux formulations partagent deux tokens.
+    structural_tokens = {
+        "both", "side", "sides", "deux", "cote", "cotes", "the", "and", "et",
+    }
+    required_tokens = requested_tokens - structural_tokens
+    excerpt_tokens = {
+        token for token in _PROOF_TOKEN_PATTERN.findall(excerpt_text)
+        if len(token) >= 3 and token not in stopwords
+    }
+    if required_tokens:
+        return required_tokens.issubset(excerpt_tokens)
+    return requested_tokens.issubset(excerpt_tokens)
+
+
+def _double_sided_seal_evidence(requested: str, excerpt: str) -> bool:
+    """Reconnaît une même fonction explicite en anglais ou en français.
+
+    Un code de désignation différent n'est pas une incompatibilité lorsque
+    l'extrait dit réellement que des joints sont présents sur les deux faces.
+    Une mention d'écrans, d'ouverture ou d'absence de joints ne suffit jamais.
+    """
+    seal = re.compile(r"\b(?:seals?|sealed|sealing|joints?|etanche(?:s|ite)?)\b")
+    sides = re.compile(r"\b(?:both\s+sides|two\s+sides|deux\s+cotes|double\s+face)\b")
+    negative = re.compile(
+        r"\b(?:not|no|without|sans|non)\s+(?:\w+\s+){0,2}"
+        r"(?:seals?|sealed|joints?|etanche(?:s|ite)?)\b"
+    )
+
+    def states_both_sides(value: str) -> bool:
+        value = _normalized_proof(value)
+        if negative.search(value):
+            return False
+        return any(
+            min(abs(a.end() - b.start()), abs(b.end() - a.start())) <= 80
+            for a in seal.finditer(value)
+            for b in sides.finditer(value)
+        )
+
+    return states_both_sides(requested) and states_both_sides(excerpt)
 
 
 _PROOF_TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
@@ -420,6 +577,82 @@ _COMPARATIVE_IDENTITY_MARKER = re.compile(
     r"compar\w*|versus|vs)\b",
     re.IGNORECASE,
 )
+
+_PROPERTY_TOKEN_ALIASES: dict[str, frozenset[str]] = {
+    "bore": frozenset({"bore", "inside", "inner", "internal", "alesage"}),
+    "inside": frozenset({"bore", "inside", "inner", "internal", "alesage"}),
+    "inner": frozenset({"bore", "inside", "inner", "internal", "alesage"}),
+    "internal": frozenset({"bore", "inside", "inner", "internal", "alesage"}),
+    "alesage": frozenset({"bore", "inside", "inner", "internal", "alesage"}),
+    "outside": frozenset({"outside", "outer", "external", "exterieur"}),
+    "outer": frozenset({"outside", "outer", "external", "exterieur"}),
+    "external": frozenset({"outside", "outer", "external", "exterieur"}),
+    "exterieur": frozenset({"outside", "outer", "external", "exterieur"}),
+    "width": frozenset({"width", "thickness", "largeur", "epaisseur"}),
+    "thickness": frozenset({"width", "thickness", "largeur", "epaisseur"}),
+    "largeur": frozenset({"width", "thickness", "largeur", "epaisseur"}),
+    "epaisseur": frozenset({"width", "thickness", "largeur", "epaisseur"}),
+    "thread": frozenset({"thread", "filetage"}),
+    "filetage": frozenset({"thread", "filetage"}),
+    "wrench": frozenset({"wrench", "spanner", "cle", "hex"}),
+    "spark": frozenset({"spark", "electrode", "electrodes"}),
+    "gap": frozenset({"gap", "ecartement"}),
+    "sealing": frozenset({"sealing", "seal", "sealed", "etanche", "etancheite", "joint", "joints"}),
+    "sealed": frozenset({"sealing", "seal", "sealed", "etanche", "etancheite", "joint", "joints"}),
+}
+
+
+def _excerpt_names_required_property(requirement: Requirement, excerpt: str) -> bool:
+    """Exige le discriminant de propriété, pas seulement le nombre et l'unité."""
+    label_tokens = set(_PROOF_TOKEN_PATTERN.findall(_normalized_proof(
+        f"{requirement.id} {requirement.label}"
+    )))
+    expected_aliases = [
+        _PROPERTY_TOKEN_ALIASES[token]
+        for token in label_tokens
+        if token in _PROPERTY_TOKEN_ALIASES
+    ]
+    if not expected_aliases:
+        return True
+    excerpt_tokens = set(_PROOF_TOKEN_PATTERN.findall(_normalized_proof(excerpt)))
+    return all(aliases & excerpt_tokens for aliases in expected_aliases)
+
+
+def _proof_is_attached_to_candidate(
+    candidate: CandidateAudit,
+    proof: SourceProof,
+    content: str,
+) -> bool:
+    """Une preuve secondaire doit vivre dans le bloc du candidat, pas à côté."""
+    from candidats import primary_product_content
+
+    primary_content = primary_product_content(content)
+    excerpt_match = _raw_literal_match(proof.excerpt, primary_content)
+    if excerpt_match is None:
+        return False
+    reference_pattern = _raw_literal_pattern(candidate.reference)
+    if not reference_pattern:
+        return True
+    reference_in_primary = _raw_literal_match(candidate.reference, primary_content)
+    if reference_in_primary is None:
+        # Une identité totalement absente ne permet pas la sélection finale,
+        # mais les tests de diagnostic conservent son score. En revanche une
+        # identité présente seulement après une section de recommandation est
+        # explicitement une piste voisine : ses données sont irrecevables.
+        return _raw_literal_match(candidate.reference, content) is None
+    for reference_match in re.finditer(
+        reference_pattern, primary_content, flags=re.IGNORECASE | re.UNICODE,
+    ):
+        distance = min(
+            abs(excerpt_match.start() - reference_match.end()),
+            abs(reference_match.start() - excerpt_match.end()),
+        )
+        if distance > _CACHED_OFFICIAL_EVIDENCE_MAX_CHARS:
+            continue
+        start, end = sorted((reference_match.end(), excerpt_match.start()))
+        if not _COMPARATIVE_IDENTITY_MARKER.search(primary_content[start:end]):
+            return True
+    return False
 _NEXT_PRODUCT_BOUNDARY = re.compile(
     r"\b(?:related|other)\s+(?:product|model|reference|ref|"
     r"produit|mod[eè]le|r[eé]f[eé]rence)\b",
@@ -497,6 +730,66 @@ def _windowed_excerpt_matches(excerpt: str, content: str) -> bool:
         if satisfied == len(needed):
             return True
     return False
+
+
+def _exact_page_span(excerpt: str, content: str) -> str:
+    """Retrouve la citation exacte quand le modèle n'a changé que les blancs.
+
+    La valeur retournée est toujours une sous-chaîne contiguë de la page. Les
+    apostrophes, tirets, accents, signes et lettres doivent rester strictement
+    identiques ; seule une suite de blancs peut remplacer une autre suite de
+    blancs. Une citation ambiguë conserve sa première occurrence exacte, qui
+    sera ensuite soumise aux contrôles sémantiques ordinaires.
+    """
+    if not excerpt or not content:
+        return ""
+    if excerpt in content:
+        return excerpt
+    pieces = re.split(r"(\s+)", excerpt)
+    pattern = "".join(
+        r"\s+" if piece.isspace() else re.escape(piece)
+        for piece in pieces if piece
+    )
+    if not pattern:
+        return ""
+    match = re.search(pattern, content)
+    if match:
+        return match.group(0)
+
+    def accent_fold_with_offsets(value: str) -> tuple[str, list[int], list[int]]:
+        folded: list[str] = []
+        starts: list[int] = []
+        ends: list[int] = []
+        for index, character in enumerate(value):
+            if character.isspace():
+                if folded and folded[-1] == " ":
+                    ends[-1] = index + 1
+                else:
+                    folded.append(" ")
+                    starts.append(index)
+                    ends.append(index + 1)
+                continue
+            decomposed = unicodedata.normalize("NFD", character)
+            bases = "".join(
+                item for item in decomposed if not unicodedata.combining(item)
+            )
+            for item in bases:
+                folded.append(item)
+                starts.append(index)
+                ends.append(index + 1)
+        return "".join(folded), starts, ends
+
+    folded_excerpt, _, _ = accent_fold_with_offsets(excerpt)
+    folded_content, starts, ends = accent_fold_with_offsets(content)
+    start = folded_content.find(folded_excerpt)
+    if (
+        not folded_excerpt
+        or start < 0
+        or folded_content.find(folded_excerpt, start + 1) >= 0
+    ):
+        return ""
+    finish = start + len(folded_excerpt) - 1
+    return content[starts[start]:ends[finish]]
 
 
 #: Une designation produit lisible telle quelle : des segments alphanumeriques
@@ -602,6 +895,53 @@ def _excerpt_is_only_an_identity(
         if jeton
     ]
     return not reste
+
+
+def _excerpt_omits_the_observed_value(
+    criterion: CriterionAudit,
+    excerpt: str,
+) -> bool:
+    """Une identite plus du bruit sans rapport ne prouve pas la valeur annoncee.
+
+    Mesure du 2026-09-15 sur un run reel : un meme extrait — un titre
+    d'annonce, « SIEMENS 3TF2000-6BB40-0KC0 Contactor Free Shipping High
+    quality » — a ete cite comme preuve du type de contacteur, du code de
+    bobine et de la tension de bobine. `_excerpt_is_only_an_identity` ne l'a
+    pas vu venir : une fois l'identite retiree, il reste « Free Shipping High
+    quality » — assez de texte pour ne plus etre « seulement une identite »,
+    rien qui parle de tension ou de type.
+
+    L'existence de l'extrait dans la page (verifiee plus haut) dit qu'il n'est
+    pas invente. Elle ne dit rien de sa pertinence : qu'il enonce bien la
+    valeur qu'on lui fait prouver. Les deux sont necessaires, ni l'une ne
+    remplace l'autre.
+
+    Se deduit du critere lui-meme, sans liste de mots ni marque : la valeur
+    observee doit apparaitre, a une variante de separateurs pres, dans
+    l'extrait cite pour elle — `_raw_literal_match` porte deja cette
+    tolerance pour le reste du module, y compris entre jetons adjacents
+    (« 9 A » retrouve « 9A »).
+
+    Repli jeton par jeton si la sequence ordonnee echoue, sans exiger l'ordre
+    d'origine : une page en tcheque prouvait « 24 V DC » par « napeti DC :
+    24 V », DC avant la valeur plutot qu'apres. Un repli, pas le chemin
+    principal : il perd la tolerance au collage (chaque jeton redevient
+    delimite seul), gagnee en echange de l'independance a l'ordre.
+    """
+    if _raw_literal_match(criterion.observed_value, excerpt) is not None:
+        return False
+    observed_text = _normalized_proof(criterion.observed_value)
+    if (
+        _POINT_PATTERN.search(observed_text) is not None
+        and _range_contains_requested(criterion.observed_value, excerpt) is True
+    ):
+        return False
+    tokens = re.findall(
+        r"[^\W_]+", unicodedata.normalize("NFKC", criterion.observed_value), re.UNICODE
+    )
+    if not tokens:
+        return True
+    return any(_raw_literal_match(token, excerpt) is None for token in tokens)
 
 
 def _is_compact_identity_value_listing(
@@ -1015,9 +1355,17 @@ def _page_has_literal_candidate_identity(
     fabricant qui cite l'alternative de prouver ses caractéristiques.
     L'import différé évite le cycle ``candidats -> compatibilite`` au chargement.
     """
-    from candidats import brand_is_present, reference_is_present
+    from candidats import (
+        brand_is_present,
+        primary_product_content,
+        reference_is_only_embedded,
+    )
+
+    content = primary_product_content(content)
 
     if not brand_is_present(candidate.brand, content):
+        return False
+    if reference_is_only_embedded(candidate.reference, content):
         return False
     # Une page cache peut exposer le code commande (p. ex. BSL07-20-10-81)
     # plutôt que la référence fabricant 4KBL. Les alias ne sont acceptés que
@@ -1047,11 +1395,15 @@ def _is_official_identity_page(
     url: str,
     content: str,
 ) -> bool:
+    from candidats import primary_product_content, reference_is_only_embedded
+
+    primary_content = primary_product_content(content)
     return bool(
         content
         and not _est_page_de_liste(url)
         and _manufacturer_domain(url, candidate.brand)
-        and _raw_literal_match(candidate.reference, content) is not None
+        and not reference_is_only_embedded(candidate.reference, primary_content)
+        and _raw_literal_match(candidate.reference, primary_content) is not None
     )
 
 
@@ -1539,18 +1891,17 @@ def _validate_candidate(
                         criterion.requirement_id,
                     )
                 continue
-            content = _normalized_proof(canonical_pages[url])
-            excerpt = _normalized_proof(proof.excerpt)
-            contiguous = bool(excerpt and excerpt in content)
-            windowed = not contiguous and _windowed_excerpt_matches(excerpt, content)
-            if not contiguous and not windowed:
+            content = canonical_pages[url]
+            excerpt = _exact_page_span(proof.excerpt, content)
+            if not excerpt:
                 if strict:
                     _rejeter(
                         f"Extrait absent de la page visitée : {proof.url}",
                         criterion.requirement_id,
                     )
                 continue
-            if _is_compact_identity_value_listing(candidate, proof.excerpt):
+            exact_proof = proof.model_copy(update={"excerpt": excerpt})
+            if _is_compact_identity_value_listing(candidate, excerpt):
                 if strict:
                     _rejeter(
                         "Un titre compact d'identite ne prouve pas une caracteristique.",
@@ -1558,7 +1909,7 @@ def _validate_candidate(
                     )
                 continue
             if _excerpt_borrows_a_neighbour_identity(
-                candidate, proof.excerpt, canonical_pages[url],
+                candidate, excerpt, canonical_pages[url],
             ):
                 if strict:
                     _rejeter(
@@ -1566,15 +1917,48 @@ def _validate_candidate(
                         criterion.requirement_id,
                     )
                 continue
-            if _excerpt_is_only_an_identity(candidate, proof.excerpt):
+            if _excerpt_is_only_an_identity(candidate, excerpt):
                 if strict:
                     _rejeter(
                         "Une designation produit seule n'enonce aucune valeur.",
                         criterion.requirement_id,
                     )
                 continue
-            grade = "windowed" if windowed else "contiguous"
-            accepted_proofs.append(proof)
+            if _excerpt_omits_the_observed_value(criterion, excerpt):
+                if strict:
+                    _rejeter(
+                        "L'extrait ne porte pas la valeur qu'il est cite pour prouver.",
+                        criterion.requirement_id,
+                    )
+                continue
+            if not _excerpt_names_required_property(requirement, excerpt):
+                if strict:
+                    _rejeter(
+                        "L'extrait n'énonce pas la propriété demandée.",
+                        criterion.requirement_id,
+                    )
+                continue
+            if not _proof_is_attached_to_candidate(candidate, exact_proof, content):
+                if strict:
+                    _rejeter(
+                        "L'extrait n'est pas rattaché au produit candidat.",
+                        criterion.requirement_id,
+                    )
+                continue
+            if (
+                effective_status == "proven"
+                and not _textual_requested_value_is_explicit(
+                    requirement, criterion, excerpt
+                )
+            ):
+                if strict:
+                    _rejeter(
+                        "L'extrait n'énonce pas la valeur textuelle demandée.",
+                        criterion.requirement_id,
+                    )
+                continue
+            grade = "contiguous"
+            accepted_proofs.append(exact_proof)
             accepted_grades.append(grade)
             proof_urls.add(url)
             if proof.type == "web_officiel" and _manufacturer_domain(proof.url, candidate.brand):
@@ -1590,9 +1974,7 @@ def _validate_candidate(
                 "evidence_rejected": True,
             }))
             continue
-        proof_grades[criterion.requirement_id] = (
-            "windowed" if "windowed" in accepted_grades else "contiguous"
-        )
+        proof_grades[criterion.requirement_id] = "contiguous"
         sanitized_criteria.append(criterion.model_copy(update={
             "status": effective_status,
             "proofs": accepted_proofs,
@@ -1784,7 +2166,11 @@ def evaluate_candidates(
             blockers = [
                 expected[key].label for key in incompatible if expected[key].critical
             ]
-            score = (100 * len(proven)) // len(notable)
+            # Le jeu de critères est figé avant l'audit. Retirer les inconnus
+            # secondaires du dénominateur rendait deux candidats incomparables.
+            scoreable_ids = notable_ids
+            proven_scoreable = [key for key in proven if key in scoreable_ids]
+            score = (100 * len(proven_scoreable)) // len(scoreable_ids)
             brand_matches = not (target_brand or "").strip() or _brand_matches(
                 candidate.brand, target_brand
             )
@@ -1819,19 +2205,20 @@ def evaluate_candidates(
                 identity_confirmed
                 and brand_matches
                 and score == 100
+                and len(proven) == len(notable)
                 and not incompatible
                 and completion_proof
             )
             # Une source produit vérifiée peut être secondaire, mais le score
-            # minimal reste le seuil de proposition. Une incompatibilité
-            # technique établie, même non critique, exclut toujours le
-            # candidat : elle est à expliquer, jamais à proposer.
+            # minimal reste le seuil de proposition. Seule une incompatibilité
+            # critique empêche le remplacement direct ; un écart secondaire
+            # reste visible dans le rapport et pèse déjà dans le score.
             eligible = (
                 identity_confirmed
                 and brand_matches
-                and bool(proven)
+                and bool(proven_scoreable)
                 and score >= threshold
-                and not incompatible
+                and not blockers
             )
             evaluations.append(CandidateEvaluation(
                 candidate=candidate,

@@ -299,7 +299,7 @@ def _git_commit() -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=DOSSIER.parent,
+            cwd=DOSSIER,
             capture_output=True,
             text=True,
             timeout=3,

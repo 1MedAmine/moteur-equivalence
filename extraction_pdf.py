@@ -12,6 +12,13 @@ from typing import Any
 import pymupdf
 
 
+# Camelot relit chaque page tabulaire dans un processus Ghostscript. Sur un
+# catalogue de centaines de pages, cette opération peut immobiliser toute une
+# vague alors que PyMuPDF a déjà fourni le texte littéral vérifiable. Les
+# fiches techniques courtes gardent l'enrichissement géométrique complet.
+MAX_PDF_PAGES_FOR_TABLE_EXTRACTION = 32
+
+
 @dataclass(frozen=True)
 class PDFExtraction:
     text: str
@@ -109,6 +116,16 @@ def extract_pdf(
     page_texts: list[str] = []
     candidate_pages: list[int] = []
     try:
+        page_count = len(document)
+    except (AttributeError, TypeError):
+        # Les doubles de test et quelques wrappers ne publient pas leur
+        # cardinalité ; conserver leur comportement historique est plus sûr
+        # que de deviner une limite.
+        page_count = None
+    enrich_tables = (
+        page_count is None or page_count <= MAX_PDF_PAGES_FOR_TABLE_EXTRACTION
+    )
+    try:
         metadata = getattr(document, "metadata", {}) or {}
         title = " ".join(str(metadata.get("title") or "").split())
         for page_number, page in enumerate(document, start=1):
@@ -117,12 +134,18 @@ def extract_pdf(
                 page_texts.append(
                     f"[PAGE page={page_number}]\n{text}\n[/PAGE]"
                 )
-            if _looks_tabular(page):
+            if enrich_tables and _looks_tabular(page):
                 candidate_pages.append(page_number)
     finally:
         document.close()
 
     text = "\n\n".join(page_texts).strip()
+    if not enrich_tables:
+        return PDFExtraction(
+            text=text,
+            title=title,
+            warnings=("Camelot: skipped_large_document",),
+        )
     if not candidate_pages:
         return PDFExtraction(text=text, title=title)
 

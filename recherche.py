@@ -10,6 +10,8 @@ impossible le contrat de preuves de la specification d'origine (url + extrait + 
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
+import unicodedata
 from typing import Callable, List, Optional, Protocol
 from urllib.parse import parse_qsl, urlsplit
 
@@ -168,7 +170,9 @@ def ajouter_marque(requete: str, marque: str) -> str:
 _PARAMETRES_DE_LISTE = frozenset({
     "page", "sort-by", "sort_by", "tri", "_nkw", "q", "search",
 })
-_SEGMENTS_DE_LISTE = frozenset({"shop", "search"})
+_SEGMENTS_DE_LISTE = frozenset({
+    "shop", "search", "cat", "collections", "manufacturers", "g",
+})
 
 
 def est_page_de_liste(url: str) -> bool:
@@ -241,6 +245,7 @@ ACTIVE_ENGINES = {
     "szn": "seznam",
     "qw": "qwant",
     "sp": "startpage",
+    "yd": "yandex",
 }
 
 
@@ -319,18 +324,82 @@ class SearxGateway:
                 continue
 
             hits = _normalize_hits(results, engine, self._max_results)
+            unresponsive_reason = _unresponsive_engine_reason(payload, engine)
+            if not hits and unresponsive_reason:
+                attempts.append(SearchAttempt(
+                    engine=engine,
+                    status="blocked",
+                    result_count=0,
+                    reason=unresponsive_reason,
+                ))
+                continue
+            relevant_hits = [hit for hit in hits if _hit_matches_query(hit, query)]
             attempts.append(SearchAttempt(
                 engine=engine,
-                status="ok" if hits else "empty",
+                status="ok" if relevant_hits else ("irrelevant" if hits else "empty"),
                 result_count=len(hits),
+                reason="no_relevant_hit" if hits and not relevant_hits else "",
             ))
-            if hits:
-                return SearchBatch(query=query, hits=hits, attempts=attempts)
+            if relevant_hits:
+                return SearchBatch(query=query, hits=relevant_hits, attempts=attempts)
 
         batch = SearchBatch(query=query, hits=[], attempts=attempts)
         if attempts and all(item.status in {"blocked", "error"} for item in attempts):
             raise SearxUnavailable("SearXNG indisponible pour cette requête", batch)
         return batch
+
+
+_SEARCH_QUERY_TOKEN = re.compile(r"[a-z0-9]+(?:[-_./×][a-z0-9]+)*", re.IGNORECASE)
+_SEARCH_GENERIC_TOKENS = frozenset({
+    "catalogue", "caracteristiques", "datasheet", "documentation", "fiche",
+    "product", "produit", "specification", "specifications", "technique",
+    "technical", "contacteur", "disjoncteur", "relais", "interrupteur",
+    "variateur", "industriel", "industrial",
+})
+
+
+def numeric_query_anchors(query: str) -> tuple[str, ...]:
+    """Repère les familles numériques autonomes, sans imposer un domaine."""
+    return tuple(dict.fromkeys(re.findall(
+        r"(?<![A-Za-z0-9])\d{4,}(?![A-Za-z0-9])", query
+    )))
+
+
+def metadata_has_numeric_anchor(metadata: str, anchors: tuple[str, ...]) -> bool:
+    """Accepte aussi une variante suffixée de la famille dans un résultat."""
+    tokens = re.findall(r"[A-Za-z0-9]+", metadata.casefold())
+    return any(token.startswith(anchor) for token in tokens for anchor in anchors)
+
+
+def _search_token_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(
+        character for character in normalized
+        if character.isalnum() and not unicodedata.combining(character)
+    )
+
+
+def _hit_matches_query(hit: SearchHit, query: str) -> bool:
+    """Écarte un moteur dont les métadonnées ne reprennent pas la recherche."""
+    haystack = "\n".join((hit.url, hit.title, hit.snippet))
+    anchors = numeric_query_anchors(query)
+    if anchors:
+        return metadata_has_numeric_anchor(haystack, anchors)
+    significant = {
+        _search_token_key(token)
+        for token in _SEARCH_QUERY_TOKEN.findall(query)
+    }
+    significant = {
+        token for token in significant
+        if len(token) >= 4 and token not in _SEARCH_GENERIC_TOKENS
+    }
+    if len(significant) < 2:
+        return True
+    haystack_tokens = {
+        _search_token_key(token)
+        for token in _SEARCH_QUERY_TOKEN.findall(haystack)
+    }
+    return len(significant & haystack_tokens) >= 2
 
 
 def _normalize_hits(results: list[object], engine: str, limit: int) -> list[SearchHit]:
@@ -351,6 +420,20 @@ def _normalize_hits(results: list[object], engine: str, limit: int) -> list[Sear
         if len(hits) == limit:
             break
     return hits
+
+
+def _unresponsive_engine_reason(payload: Mapping[str, object], engine: str) -> str:
+    entries = payload.get("unresponsive_engines")
+    if not isinstance(entries, list):
+        return ""
+    for entry in entries:
+        if (
+            isinstance(entry, (list, tuple))
+            and len(entry) >= 2
+            and str(entry[0]).casefold() == engine.casefold()
+        ):
+            return " ".join(str(entry[1]).split())[:120]
+    return ""
 
 
 def _is_blocked(exc: Exception) -> bool:

@@ -406,7 +406,7 @@ def _evaluations_proposees(outcome: ResearchOutcome) -> list:
         pool = [outcome.evaluation]
     by_identity = {}
     for evaluation in pool:
-        if not evaluation.eligible or evaluation.summary.incompatible_criteria:
+        if not evaluation.eligible:
             continue
         key = (
             evaluation.summary.brand.strip().casefold(),
@@ -452,6 +452,8 @@ def _candidats_proposes(outcome: ResearchOutcome) -> list[dict]:
 def _candidats_ecartes(outcome: ResearchOutcome) -> list[dict]:
     discarded: list[dict] = []
     for evaluation in outcome.evaluations:
+        if evaluation.eligible:
+            continue
         incompatible = list(evaluation.summary.incompatible_criteria)
         if not incompatible:
             continue
@@ -499,13 +501,17 @@ def _construire_adaptatif(outcome: ResearchOutcome) -> dict:
             f"{item['brand']} {item['reference']} ({item['score']} %)"
             for item in proposed_candidates
         )
+        unresolved = list(dict.fromkeys((
+            *summary.not_proven_criteria,
+            *summary.unverified_criteria,
+        )))
         alternative = (
             f"1. Produit demandé : {outcome.requirements.product}\n"
             f"2. Alternative la plus pertinente : {summary.brand} {summary.reference}\n"
             f"3. Justification et limites : compatibilité déterministe de "
             f"{summary.score} %. Critères prouvés : "
             f"{', '.join(summary.proven_criteria) or 'aucun'}. "
-            f"Points non prouvés : {', '.join(summary.not_proven_criteria) or 'aucun'}. "
+            f"Points non prouvés : {', '.join(unresolved) or 'aucun'}. "
             f"Incompatibilités : {', '.join(summary.incompatible_criteria) or 'aucune'}. "
             f"Niveau de preuve : {evidence_note}\n"
             f"4. Candidats admissibles : {proposed_names}"
@@ -946,6 +952,23 @@ def erreur_analyse(
                 requirement_diagnostics
             ),
         },
+    }
+
+
+def analyse_interrompue() -> dict:
+    """Rend une sortie explicite quand le processus est interrompu.
+
+    Aucun resultat partiel n'est invente : l'interruption peut survenir entre
+    la recuperation d'une page et son audit, donc aucun candidat ne peut etre
+    considere comme rendu.
+    """
+    return {
+        "status": STATUT_ANALYSE,
+        "alternative_proposee": "",
+        "compatibility": None,
+        "warnings": ["Analyse interrompue avant qu'un verdict soit rendu."],
+        "sources": [],
+        "diagnostics": {},
     }
 
 

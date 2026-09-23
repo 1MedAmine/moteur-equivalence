@@ -130,6 +130,25 @@ def test_analysis_failure_is_safe_and_not_not_resolved(tmp_path):
     assert "secret-provider-detail" not in data["warnings"][0]
 
 
+def test_interrupted_analysis_returns_a_safe_report(tmp_path):
+    """Une interruption du terminal ne doit jamais supprimer la sortie."""
+    class Research:
+        def run(self, text, brand):
+            raise KeyboardInterrupt()
+
+    data = outil.executer(
+        str(fiche(tmp_path)),
+        None,
+        config_loader=lambda: B2Config(api_key="test"),
+        research_factory=lambda config: Research(),
+    )
+
+    assert data["status"] == "analysis_error"
+    assert data["warnings"] == [
+        "Analyse interrompue avant qu'un verdict soit rendu."
+    ]
+
+
 def test_requirement_failure_exposes_only_stage_and_path(tmp_path):
     class Research:
         def run(self, text, brand):

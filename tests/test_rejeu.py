@@ -309,6 +309,13 @@ def test_replay_cli_forces_utf8_when_windows_code_page_cannot_encode_report(
 ):
     outcome = _outcome()
     unicode_excerpt = "Řídicí stykač tripolaire"
+    # La valeur demandee et observee doit rester alignee sur ce nouvel
+    # extrait : ce test verifie l'encodage UTF-8 du rejeu, pas la pertinence
+    # de la preuve, mais celle-ci reste requise pour que le critere passe
+    # `proven` et atteigne la sortie JSON.
+    outcome.requirements.criteria[1].requested_value = unicode_excerpt
+    outcome.audits[0].candidates[0].criteria[1].requested_value = unicode_excerpt
+    outcome.audits[0].candidates[0].criteria[1].observed_value = unicode_excerpt
     outcome.audits[0].candidates[0].criteria[1].proofs[0].excerpt = unicode_excerpt
     outcome.visited_pages[URL] = f"Norel REF-1. {unicode_excerpt}."
     corpus = tmp_path / "unicode-corpus"
@@ -716,6 +723,25 @@ def test_capture_refuses_to_overwrite_an_existing_directory(tmp_path):
         )
     assert marker.read_text(encoding="utf-8") == "keep-me\n"
     assert not (corpus / "pages.json").exists()
+
+
+def test_manifest_reads_commit_from_the_project_root(monkeypatch):
+    import rejeu
+
+    captured = {}
+
+    class Result:
+        returncode = 0
+        stdout = "abc123\n"
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(rejeu.subprocess, "run", fake_run)
+
+    assert rejeu._git_commit() == "abc123"
+    assert captured["cwd"] == rejeu.DOSSIER
 
 
 def test_capture_failure_never_publishes_a_partial_destination(

@@ -24,7 +24,7 @@ from configuration import B2Config
 from planification import Planner
 from recherche import SearxGateway
 from recherche_adaptative import AdaptiveResearch
-from routage_searx import ENGINE_SHORTCUTS, EngineRotation
+from routage_searx import EngineRotation
 from cache_pages import avec_cache
 from scraping import PageFetcher
 
@@ -34,7 +34,7 @@ def _build_research(config: B2Config) -> AdaptiveResearch:
         planner=Planner(config),
         gateway=SearxGateway(
             base_url=config.searxng_url,
-            rotation=EngineRotation(ENGINE_SHORTCUTS),
+            rotation=EngineRotation(config.search_engine_shortcuts),
             timeout=config.network_timeout,
             max_results=config.max_results_per_query,
             max_attempts=config.adaptive_engine_attempts,
@@ -128,6 +128,11 @@ def executer(
         return rapport.construire(outcome)
     except configuration.ConfigurationIncomplete as exc:
         return rapport.erreur_configuration(str(exc))
+    except KeyboardInterrupt:
+        # Une interruption operateur ou du terminal n'est ni une absence de
+        # candidat ni une erreur fournisseur. Produire une sortie explicite
+        # evite de laisser l'appelant sans rapport ni verdict maquille.
+        return rapport.analyse_interrompue()
     except Exception as exc:
         if est_limitation_llm(exc):
             return rapport.service_indisponible()

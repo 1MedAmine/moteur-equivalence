@@ -198,7 +198,7 @@ def _safe_head_identity(soup: BeautifulSoup, title: str) -> str:
     if title:
         add("title", title)
 
-    def walk(value: object) -> None:
+    def walk(value: object, parent_key: str = "") -> None:
         if len(lines) >= MAX_HEAD_IDENTITY_VALUES:
             return
         if isinstance(value, Mapping):
@@ -209,12 +209,17 @@ def _safe_head_identity(soup: BeautifulSoup, title: str) -> str:
                     and isinstance(child, (str, int, float))
                     and not isinstance(child, bool)
                 ):
-                    add(f"jsonld.{normalized_key}", child)
+                    label = (
+                        f"jsonld.{parent_key}.{normalized_key}"
+                        if parent_key in {"brand", "manufacturer", "seller"}
+                        else f"jsonld.{normalized_key}"
+                    )
+                    add(label, child)
                 if isinstance(child, (Mapping, list, tuple)):
-                    walk(child)
+                    walk(child, normalized_key)
         elif isinstance(value, (list, tuple)):
             for child in value:
-                walk(child)
+                walk(child, parent_key)
 
     for script in soup.find_all("script"):
         if str(script.get("type") or "").casefold() != "application/ld+json":
@@ -300,6 +305,7 @@ class PageFetcher:
         rate_limiter: B2RateLimiter | None = None,
         pdf_scraper: Any = None,
         camoufox: Any = None,
+        enable_camoufox: bool = False,
     ) -> None:
         self.timeout = timeout
         self.rate_limit_delay = rate_limit_delay
@@ -308,6 +314,14 @@ class PageFetcher:
         self._rate_limiter = rate_limiter or _RATE_LIMITER
         self._pdf_scraper = pdf_scraper
         self._camoufox = camoufox
+        # Camoufox est un navigateur tiers dont le processus peut rester bloque
+        # au-dela du timeout de navigation. Il est reserve a un appel explicite
+        # (ou a une injection de test), jamais au chemin standard.
+        self._enable_camoufox = enable_camoufox or camoufox is not None
+        # Les fetchs rapides restent paralleles, mais chaque barreau navigateur
+        # demarre un vrai processus. Deux Chromium/Firefox simultanes peuvent
+        # epuiser la memoire et bloquer une vague entiere.
+        self._browser_lock = threading.Lock()
         # Hotes ayant deja oppose un refus a Camoufox pendant ce run. Un
         # `set` suffit : sous le GIL, `add` et `in` sont atomiques, et les
         # deux fils de `_fetch_pages` n'y ecrivent que des hotes deja
@@ -468,7 +482,7 @@ class PageFetcher:
         centaines de millisecondes, et un chemin different peut repondre la ou
         un autre bloque. Seul le barreau a quarante-cinq secondes est retire.
         """
-        return hote not in self._hotes_sans_camoufox
+        return self._enable_camoufox and hote not in self._hotes_sans_camoufox
 
     def fetch(self, url: str) -> PageContent:
         parsed = urlparse(url)
@@ -501,23 +515,24 @@ class PageFetcher:
         if page is not None:
             return page
 
-        page, stealthy_attempt = self._attempt(
-            "stealthy",
-            url,
-            lambda: self._stealthy_fetcher().fetch(
+        with self._browser_lock:
+            page, stealthy_attempt = self._attempt(
+                "stealthy",
                 url,
-                timeout=int(self.timeout * 1000),
-                headless=True,
-                block_ads=True,
-                disable_resources=False,
-                solve_cloudflare=False,
-                # 1 = un seul essai, pas un reessai. `0` semble dire la meme
-                # chose mais Scrapling le refuse (`Expected int >= 1`) : le mode
-                # furtif mourait alors en TypeError avant meme d'ouvrir un
-                # navigateur, et l'echelle n'avait en pratique qu'un barreau.
-                retries=1,
-            ),
-        )
+                lambda: self._stealthy_fetcher().fetch(
+                    url,
+                    timeout=int(self.timeout * 1000),
+                    headless=True,
+                    block_ads=True,
+                    disable_resources=False,
+                    solve_cloudflare=False,
+                    # 1 = un seul essai, pas un reessai. `0` semble dire la meme
+                    # chose mais Scrapling le refuse (`Expected int >= 1`) : le mode
+                    # furtif mourait alors en TypeError avant meme d'ouvrir un
+                    # navigateur, et l'echelle n'avait en pratique qu'un barreau.
+                    retries=1,
+                ),
+            )
         if page is not None:
             return page
 
@@ -532,11 +547,12 @@ class PageFetcher:
         if any(
             item.status in BOT_PROTECTION_STATUSES for item in tentatives
         ) and self._camoufox_vaut_la_peine(hote):
-            page, camoufox_attempt = self._attempt(
-                "camoufox",
-                url,
-                lambda: self._camoufox_fetcher().fetch(url),
-            )
+            with self._browser_lock:
+                page, camoufox_attempt = self._attempt(
+                    "camoufox",
+                    url,
+                    lambda: self._camoufox_fetcher().fetch(url),
+                )
             tentatives.append(camoufox_attempt)
             if page is not None:
                 return page

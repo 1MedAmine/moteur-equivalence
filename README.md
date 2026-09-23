@@ -2,8 +2,9 @@
 
 **Une pièce demandée n'est plus au catalogue, ou seulement disponible chez un
 concurrent.** Ce moteur cherche une référence commandable qui puisse la
-remplacer, et ne rend jamais un candidat sans les preuves — lues sur des
-pages réellement téléchargées — qui montrent qu'il en est vraiment un.
+remplacer. Il accompagne chaque critère prouvé d'un extrait lu sur une page
+réellement téléchargée. Un candidat `partial` reste une proposition à vérifier
+pour les critères absents et les conditions d'emploi.
 
 ---
 
@@ -21,15 +22,16 @@ flowchart LR
     SCORE --> STATUT[[complete / partial /<br/>rejected / not_resolved]]
 ```
 
-Le modèle de langage ne fait que lire une page et en extraire des valeurs :
-la vérification, le score et le classement sont du code déterministe, pas un
-jugement du modèle.
+Le modèle extrait les critères, prépare des requêtes et renseigne les critères
+des candidats. Le code vérifie ensuite les extraits, calcule le score et classe
+les candidats ; le pourcentage n'est pas une confiance inventée par le modèle.
 
 ### Ce qui vaut le détour
 
-**1. Une preuve est une page, pas une affirmation.** Le moteur ne demande
-jamais à un modèle de juger. Sur un run réel documenté dans le journal de
-conception, un mode où le modèle rédigeait *et* notait sa propre confiance a
+**1. Une preuve est une page, pas une affirmation.** Le modèle propose des
+statuts, mais le code refuse un critère `proven` sans extrait vérifiable. Sur
+un run réel décrit dans le journal de conception, un mode où le modèle
+rédigeait *et* notait sa propre confiance a
 rendu quatre équivalents « certains » dont quatre étaient faux — dont deux
 partageaient un code produit entre fabricants concurrents, signal net de
 fabrication pure.
@@ -68,18 +70,34 @@ gagner. Voici les nôtres, et elles ne sont pas un détail en bas de page.
   logiques, trente-six appels moteur, trente-six pages ouvertes au maximum
   par mission. `not_resolved` veut dire « non prouvé dans ce budget », jamais
   « n'existe pas ».
-- **La preuve directe exige un domaine fabricant reconnu.** Un distributeur
-  ou une place de marché peut suggérer une référence, jamais la prouver
-  seul : il faut une page officielle, ou le recoupement d'au moins deux
-  domaines indépendants. Un fabricant qui ne publie rien en ligne dans une
-  forme que le moteur puisse lire reste hors de portée, même quand la
-  référence existe réellement.
-- **Aucune donnée réelle.** Les marques, références et pages de démonstration
-  et de test sont entièrement inventées (voir
+- **Une source unique ne suffit pas au statut `complete`.** Une fiche de
+  distributeur peut prouver des critères et donner un candidat `partial`.
+  Pour `complete`, il faut une preuve technique sur un domaine fabricant
+  reconnu ou sur au moins trois domaines source indépendants. Un fabricant
+  qui ne publie rien dans une forme lisible peut donc rester hors de portée.
+- **Aucun corpus réel publié.** Les marques, références et pages du corpus de
+  démonstration sont inventées (voir
   [`marques.exemple.json`](marques.exemple.json) et
-  [`scripts/fabriquer_corpus_rejeu.py`](scripts/fabriquer_corpus_rejeu.py)) :
-  aucun catalogue, aucune fiche, aucun contenu web réel n'est publié dans ce
-  dépôt.
+  [`scripts/fabriquer_corpus_rejeu.py`](scripts/fabriquer_corpus_rejeu.py)).
+  L'exemple réel ci-dessous donne des liens et de courts extraits vérifiés ;
+  ses pages capturées et son corpus de rejeu ne sont pas publiés dans le dépôt.
+- **La passe vision est hors service.** Le modèle par défaut
+  (`nvidia/nemotron-nano-12b-v2-vl`) a été retiré par son fournisseur le
+  2026-08-26 ; un remplaçant testé (`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`)
+  s'est montré instable sur cet endpoint — erreurs 500 et 503, réponses non
+  conformes selon l'essai. Seul le chemin fiche **PDF** en dépend : cette
+  passe ne se déclenche que sur une source `.pdf`. Le chemin d'intégration
+  JSON (`cli.py`) ne l'utilise jamais, puisqu'il écrit toujours une fiche
+  texte.
+- **Le rejeu reproduit le verdict, pas encore chaque piste.** Le statut, le
+  candidat retenu et son score se rejouent à l'identique. Les pistes
+  candidates (`candidate_leads`) ne s'y reproduisent pas encore toujours : un
+  run réel a montré une piste trouvée en direct absente au rejeu du même
+  corpus, sans changer le verdict final.
+- **Le filtrage du bruit avant ouverture est partiel.** Sur un run réel
+  mesuré, 14 des 36 pages ouvertes étaient hors sujet (une chaîne de
+  télévision, des définitions de dictionnaire, une page d'aide YouTube) ;
+  9 ont été effectivement écartées par le filtre.
 
 ---
 
@@ -99,6 +117,46 @@ demande aucune clé.
 
 Faire tourner la recherche pour de vrai (web, LLM) demande une installation
 plus lourde : voir [Installation](#installation).
+
+## Exemple réel vérifié : SKF 6205-2RSH
+
+Le 24 septembre 2026, un run en mode ouvert, sans marque concurrente imposée,
+a pris comme entrée une fiche texte construite à partir de la
+[table dimensionnelle SKF](https://cdn.skfmediahub.skf.com/api/public/0901d196802809de/pdf_preview_medium/0901d196802809de_pdf_preview_medium.pdf)
+et de la [documentation SKF sur les joints RSH](https://www.skf.com/binaries/pub12/Images/SKF%20Explorer%20deep%20groove%20ball%20bearings%20with%20RSL%20and%20RSH%20seals_6270%20EN_tcm_12-179206.pdf).
+Elle contenait les lignes suivantes, sans référence d'alternative :
+
+```text
+SKF
+6205-2RSH
+Single row deep groove ball bearings
+Principal dimensions
+d D B
+mm
+25 52 15
+2RSH: a seal on both sides
+```
+
+La demande portait donc sur un roulement rigide à billes à une rangée de
+**25 × 52 × 15 mm**, avec un joint des deux côtés.
+
+| Candidat proposé | Score | Statut | Preuve sur la fiche produit téléchargée |
+| --- | ---: | --- | --- |
+| [Codex 6205 2RS](https://sdn-distrib.com/roulements/roulement-a-billes-6205-2rs-diametre-25x52x15mm-etanche-eau-et-poussiere-codex.html) | 100 % | `partial` | La page attribue la référence à Codex, donne les trois cotes et indique des « joints en caoutchouc double face (2RS) ». |
+| [DPI 6205-2RS](https://platinum-international.store/fr/product/dpi-6205-2rs-deep-groove-ball-bearing/) | 100 % | `partial` | Le bloc technique nomme DPI comme fabricant, publie `6205-2RS` sous `Model:`, les trois cotes et `Contact seal,on both sides` sous `Sealing:`. |
+
+Pour les deux, chaque extrait marqué `proven` a été retrouvé **littéralement**
+dans la page capturée et relu pour vérifier qu'il énonce bien la valeur du
+critère. Le score signifie **quatre critères demandés sur quatre prouvés** ;
+il ne certifie pas toute condition d'emploi. Le statut reste `partial` car
+chaque candidat repose sur une seule source secondaire. Le run a également
+proposé TIMKEN 6205-2RS-C3 à 75 %, sans preuve acceptée pour l'étanchéité ;
+il n'est pas retenu ici comme équivalent vérifié.
+
+Ce run montre aussi une limite de diagnostic : `stop_reason` vaut
+`NO_PROVABLE_CANDIDATE` alors que `final_state` vaut `candidate_selected`.
+Le verdict et les preuves ci-dessus proviennent des candidats effectivement
+proposés ; ce libellé de fin reste à corriger.
 
 ## Liens
 
@@ -139,13 +197,16 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\patchright.exe install chromium
 .venv\Scripts\scrapling.exe install
+.venv\Scripts\camoufox.exe fetch
 Copy-Item .env.example .env
 ```
 
 Le navigateur est installé par `patchright`, pas par `playwright` : Scrapling
 pilote le mode furtif via patchright, dont les binaires sont distincts. Sans
 cette commande, `StealthyFetcher` échoue au lancement et le moteur perd le
-second étage de récupération.
+second étage de récupération. `camoufox fetch` installe le troisième palier :
+un moteur Firefox distinct, tenté uniquement quand les deux premiers ont
+échoué sur un hôte qui bloque spécifiquement les navigateurs Chromium.
 
 Renseigner uniquement `B2_API_KEY` dans `.env`. Le fichier réel est ignoré
 par Git. Le moteur accepte aussi, dans cet ordre, `NVIDIA_API_KEY` puis
@@ -188,7 +249,9 @@ Codes de sortie :
    maximum.
 5. Le moteur déduplique les résultats et ouvre au maximum douze nouvelles pages
    par vague, dans la limite de trente-six pour la mission entière.
-6. Scrapling essaie `Fetcher`, puis `StealthyFetcher`. Si les deux échouent,
+6. Scrapling essaie `Fetcher`, puis `StealthyFetcher` — deux moteurs Chromium.
+   S'ils échouent tous les deux sur un hôte qui n'a pas déjà opposé le même
+   refus, Camoufox (Firefox) prend le relais. Si les trois échouent,
    ScrapeGraphAI charge lui-même l'URL.
 7. ScrapeGraphAI audite chaque candidat critère par critère avec des extraits
    littéraux.
@@ -248,8 +311,8 @@ score = 100 × critères prouvés ÷ nombre total de critères
 
 - `complete` : 100 %, marque cible respectée, aucune incompatibilité, avec
   preuve technique officielle ou trois domaines source indépendants ;
-- `partial` : au moins 75 %, marque cible respectée, aucune incompatibilité,
-  avec preuve vérifiée mais corroboration insuffisante pour `complete` ;
+- `partial` : candidat admissible à au moins 75 %, sans incompatibilité
+  critique prouvée, mais sans corroboration suffisante pour `complete` ;
 - `rejected` : incompatibilité prouvée, sans candidat qu'une autre page sauve ;
 - `not_resolved` : moins de 75 % ou preuve insuffisante, sans incompatibilité
   prouvée.
